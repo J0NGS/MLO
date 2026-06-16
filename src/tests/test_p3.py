@@ -3,7 +3,10 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
-from problems.p3_datacenter_flows import build_model, random_instance, fractional_knapsack_bound
+from problems.p3_datacenter_flows import (
+    build_model, random_instance, fractional_knapsack_bound,
+    greedy_integer_solution, KnapsackBnB,
+)
 from core import BranchAndBound, BranchAndCut
 
 
@@ -52,7 +55,11 @@ def test_fractional_bound_is_upper_bound():
     priority = [50, 30, 70, 20, 60, 40, 65]
     banda_cap, buffer_cap = 100, 25
 
-    fk = fractional_knapsack_bound(banda, buffer, priority, banda_cap, buffer_cap)
+    # Items sorted by priority/banda ratio (greedy order)
+    n = len(banda)
+    order = sorted(range(n), key=lambda j: priority[j] / banda[j], reverse=True)
+    fk = fractional_knapsack_bound(banda, priority, float(banda_cap), order)
+
     model = build_model(banda, buffer, priority, banda_cap, buffer_cap)
     result = BranchAndBound(model, strategy="best_first").solve()
 
@@ -118,10 +125,61 @@ def test_tight_capacity():
     print(f"PASS: tight_capacity | obj={result.obj_value:.1f} | selected=F1 only")
 
 
+def test_knapsack_bnb_optimal_gap():
+    """KnapsackBnB must prove optimality (gap=0%) and match core B&B value."""
+    banda    = [30, 20, 45, 15, 35, 25, 40]
+    buffer   = [8,  5,  10,  3,  9,  6,  7]
+    priority = [50, 30, 70, 20, 60, 40, 65]
+    banda_cap, buffer_cap = 100, 25
+
+    g_val, x_g = greedy_integer_solution(banda, buffer, priority, banda_cap, buffer_cap)
+    r = KnapsackBnB(banda, buffer, priority, banda_cap, buffer_cap,
+                    initial_incumbent=g_val, initial_x=x_g).solve()
+
+    assert r.status == "optimal", f"Expected optimal, got {r.status}"
+    assert abs(r.obj_value - 165.0) < 1e-4, f"Expected 165, got {r.obj_value}"
+    assert abs(r.gap_pct) < 1e-6, f"Expected gap=0%, got {r.gap_pct:.4f}%"
+    assert r.root_fk_bound >= r.obj_value - 1e-6, \
+        f"FK root bound {r.root_fk_bound} < optimal {r.obj_value}"
+
+    selected = set(j for j in range(len(banda)) if round(r.x[j]) == 1)
+    assert selected == {4, 5, 6}, f"Expected {{F5,F6,F7}}, got {{'F'+str(j+1) for j in selected}}"
+
+    print(f"PASS: knapsack_bnb_gap | obj=165 | FK_root={r.root_fk_bound:.2f} | "
+          f"gap=0.0% | nodes={r.nodes_explored}")
+
+
+def test_knapsack_bnb_matches_core_bnb():
+    """KnapsackBnB must find the same optimal as core BranchAndBound for multiple instances."""
+    for seed, n_flows in [(1, 10), (2, 20)]:
+        banda, buf, priority = random_instance(n_flows, seed=seed)
+        scale = n_flows / 7
+        bc_cap  = int(100 * scale * 0.6)
+        buf_cap = int(25  * scale * 0.6)
+
+        model = build_model(banda, buf, priority, bc_cap, buf_cap)
+        r_core = BranchAndBound(model, strategy="best_first").solve()
+
+        g_val, x_g = greedy_integer_solution(banda, buf, priority, bc_cap, buf_cap)
+        r_knap = KnapsackBnB(banda, buf, priority, bc_cap, buf_cap,
+                              initial_incumbent=g_val, initial_x=x_g).solve()
+
+        assert r_knap.status == "optimal", f"seed={seed}: got {r_knap.status}"
+        assert abs(r_knap.obj_value - r_core.obj_value) < 1e-4, (
+            f"seed={seed}: KnapsackBnB={r_knap.obj_value} != core={r_core.obj_value}"
+        )
+        assert abs(r_knap.gap_pct) < 1e-6, f"seed={seed}: gap not 0%"
+
+        print(f"PASS: bnb_matches | seed={seed} n={n_flows} | "
+              f"opt={r_knap.obj_value:.1f} | nodes={r_knap.nodes_explored}")
+
+
 if __name__ == "__main__":
     test_instance_original()
     test_fractional_bound_is_upper_bound()
     test_bb_vs_bc_same_result()
     test_instance_random_medium()
     test_tight_capacity()
+    test_knapsack_bnb_optimal_gap()
+    test_knapsack_bnb_matches_core_bnb()
     print("\nAll tests passed!")
