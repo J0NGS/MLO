@@ -39,7 +39,7 @@ def solve_relaxation(
     b_ub = np.concatenate(b_ub_parts) if b_ub_parts else None
 
     bounds = node_bounds if node_bounds is not None else model.bounds
-
+    ## ----------------------------------------------------------
     result: OptimizeResult = linprog(
         c,
         A_ub=A_ub,
@@ -49,6 +49,7 @@ def solve_relaxation(
         bounds=bounds,
         method="highs",
     )
+    ## ----------------------------------------------------------
 
     if result.status == 0:
         raw_obj = float(result.fun)

@@ -118,7 +118,7 @@ def greedy_integer_solution(
 
 
 # ------------------------------------------------------------------
-# KnapsackBnB — B&B with fractional knapsack bounding at each node
+# KnapsackBnB — B&B with FK bounding + most-infeasible branching
 # ------------------------------------------------------------------
 
 @dataclass
@@ -138,10 +138,11 @@ class KnapsackBnB:
     """
     Best-first Branch-and-Bound for binary 2D knapsack.
 
-    Bounding:   greedy fractional knapsack by priority/banda ratio,
-                using remaining bandwidth at each node.
-                Buffer constraint enforced for feasibility only.
-    Branching:  follows greedy sorted order (highest ratio first).
+    Bounding:   greedy fractional knapsack by priority/banda ratio applied to
+                the FREE variables at each node, using remaining bandwidth.
+                Buffer constraint is enforced only for feasibility.
+    Branching:  most-infeasible — branch on the FK break item (the unique
+                fractional variable in the FK relaxation at the current node).
     Warm-start: accepts initial_incumbent and initial_x.
     """
 
@@ -164,84 +165,127 @@ class KnapsackBnB:
         self.n = len(banda)
         self.time_limit = time_limit
 
-        # Fixed greedy order for branching and bounding
+        # Greedy sort order: descending priority/banda ratio
         self.order = sorted(range(self.n),
                             key=lambda j: self.priority[j] / self.banda[j],
                             reverse=True)
 
         self.incumbent = float(initial_incumbent)
-        self.best_x = np.array(initial_x) if initial_x is not None else np.zeros(self.n)
+        self.best_x = (np.array(initial_x, dtype=float)
+                       if initial_x is not None else np.zeros(self.n))
 
-    def _node_bound(self, depth: int, rem_banda: float, cur_prio: float) -> float:
+    def _fk(self, rem_banda: float, cur_prio: float,
+            free_bits: int) -> tuple[float, int | None]:
         """
-        Fractional knapsack upper bound at a node.
-        `depth` = next position in sorted order to decide.
-        `rem_banda` = remaining bandwidth after items fixed to 1.
-        `cur_prio`  = total priority of items already fixed to 1.
+        FK relaxation over free items encoded as bitmask `free_bits`.
+        Iterates in greedy ratio order (self.order), skipping fixed items.
+        Returns (bound, break_j): total FK upper bound and the index of the
+        first fractional item, or None when every free item fits fully.
         """
-        return cur_prio + fractional_knapsack_bound(
-            self.banda, self.priority, rem_banda,
-            [self.order[k] for k in range(depth, self.n)],
-        )
+        cap   = rem_banda
+        bound = cur_prio
+        for j in self.order:
+            if not (free_bits >> j & 1):
+                continue          # item already fixed, skip
+            if cap <= 1e-9:
+                break             # bandwidth gone, remaining items get x=0
+            if self.banda[j] <= cap + 1e-9:
+                bound += self.priority[j]
+                cap   -= self.banda[j]
+            else:
+                bound += self.priority[j] * cap / self.banda[j]
+                return bound, j   # break item (unique fractional var)
+        return bound, None        # FK solution is integer
+
+    def _update_incumbent(self, cur_p: float, rem_b: float, rem_buf: float,
+                          free_bits: int, sel_bits: int) -> None:
+        """
+        FK relaxation gave no break item → take every free item that fits
+        BOTH constraints (greedy), update incumbent if improved.
+        """
+        p, rb, rbuf, bits = cur_p, rem_b, rem_buf, sel_bits
+        for j in self.order:
+            if not (free_bits >> j & 1):
+                continue
+            if self.banda[j] <= rb + 1e-9 and self.buffer[j] <= rbuf + 1e-9:
+                p    += self.priority[j]
+                rb   -= self.banda[j]
+                rbuf -= self.buffer[j]
+                bits |= (1 << j)
+        if p > self.incumbent + 1e-8:
+            self.incumbent = p
+            x_new = np.zeros(self.n)
+            for j in range(self.n):
+                if bits >> j & 1:
+                    x_new[j] = 1.0
+            self.best_x = x_new
 
     def solve(self) -> KnapsackResult:
         t0 = time.time()
 
-        root_bound = self._node_bound(0, self.banda_cap, 0.0)
+        # All items free at root; bitmask with bits 0..n-1 set
+        root_bits  = (1 << self.n) - 1
+        root_bound, _ = self._fk(self.banda_cap, 0.0, root_bits)
 
-        # Heap entry: (-bound, depth, rem_banda, rem_buffer, cur_priority, sel_mask)
-        # sel_mask: bit k set means self.order[k] was fixed to 1
-        heap: list = [(-root_bound, 0, self.banda_cap, self.buffer_cap, 0.0, 0)]
+        # Heap entry: (-bound, counter, rem_banda, rem_buffer, cur_prio,
+        #              free_bits, sel_bits)
+        # free_bits : bitmask of items not yet fixed (1 = free)
+        # sel_bits  : bitmask of items fixed to 1
+        counter = 0
+        heap: list = [(-root_bound, counter, self.banda_cap, self.buffer_cap,
+                        0.0, root_bits, 0)]
         nodes = 0
 
         while heap:
             if time.time() - t0 > self.time_limit:
                 best_bound = -heap[0][0]
                 gap = 100.0 * (best_bound - self.incumbent) / max(abs(self.incumbent), 1e-9)
-                return KnapsackResult("timeout", self.incumbent, np.array(self.best_x),
-                                      root_bound, best_bound, gap, nodes, time.time() - t0)
+                return KnapsackResult("timeout", self.incumbent,
+                                      self.best_x.copy(), root_bound,
+                                      best_bound, gap, nodes, time.time() - t0)
 
-            neg_b, depth, rem_b, rem_buf, cur_p, sel_mask = heapq.heappop(heap)
+            neg_b, _, rem_b, rem_buf, cur_p, free_bits, sel_bits = heapq.heappop(heap)
             bound = -neg_b
             nodes += 1
 
-            # Prune by bound
             if bound <= self.incumbent + 1e-8:
                 continue
 
-            # Leaf: all n positions decided
-            if depth == self.n:
-                if cur_p > self.incumbent + 1e-8:
-                    self.incumbent = cur_p
-                    x_new = np.zeros(self.n)
-                    for k in range(self.n):
-                        if sel_mask & (1 << k):
-                            x_new[self.order[k]] = 1.0
-                    self.best_x = x_new
+            # Find break item (most-infeasible = unique fractional var in FK)
+            _, break_j = self._fk(rem_b, 0.0, free_bits)
+
+            if break_j is None:
+                # FK is integer → try to take all free items respecting buffer
+                self._update_incumbent(cur_p, rem_b, rem_buf, free_bits, sel_bits)
                 continue
 
-            j = self.order[depth]
+            # Branch on break_j -----------------------------------------------
+            remaining_bits = free_bits & ~(1 << break_j)   # clear break item
 
-            # Branch x_j = 1 (if feasible for both constraints)
-            if rem_b >= self.banda[j] - 1e-9 and rem_buf >= self.buffer[j] - 1e-9:
-                new_p = cur_p + self.priority[j]
-                b1 = self._node_bound(depth + 1, rem_b - self.banda[j], new_p)
+            # x_{break_j} = 1  (feasibility: both bandwidth and buffer)
+            if (rem_b  >= self.banda[break_j]  - 1e-9 and
+                    rem_buf >= self.buffer[break_j] - 1e-9):
+                new_rem_b   = rem_b   - self.banda[break_j]
+                new_rem_buf = rem_buf - self.buffer[break_j]
+                new_p       = cur_p   + self.priority[break_j]
+                b1, _ = self._fk(new_rem_b, new_p, remaining_bits)
                 if b1 > self.incumbent + 1e-8:
-                    heapq.heappush(heap, (
-                        -b1, depth + 1,
-                        rem_b - self.banda[j], rem_buf - self.buffer[j],
-                        new_p, sel_mask | (1 << depth),
-                    ))
+                    counter += 1
+                    heapq.heappush(heap, (-b1, counter, new_rem_b, new_rem_buf,
+                                          new_p, remaining_bits,
+                                          sel_bits | (1 << break_j)))
 
-            # Branch x_j = 0
-            b0 = self._node_bound(depth + 1, rem_b, cur_p)
+            # x_{break_j} = 0
+            b0, _ = self._fk(rem_b, cur_p, remaining_bits)
             if b0 > self.incumbent + 1e-8:
-                heapq.heappush(heap, (-b0, depth + 1, rem_b, rem_buf, cur_p, sel_mask))
+                counter += 1
+                heapq.heappush(heap, (-b0, counter, rem_b, rem_buf,
+                                      cur_p, remaining_bits, sel_bits))
 
         elapsed = time.time() - t0
-        # Queue exhausted → proven optimal; best_bound = incumbent → gap = 0 %
+        # Queue exhausted → proven optimal; gap = 0 %
         return KnapsackResult(
-            "optimal", self.incumbent, np.array(self.best_x),
+            "optimal", self.incumbent, self.best_x.copy(),
             root_bound, self.incumbent, 0.0, nodes, elapsed,
         )
 
@@ -384,7 +428,8 @@ if __name__ == "__main__":
 
         print("\n--- B&B (bound FK) ---")
         bnb_r = KnapsackBnB(banda, buffer, priority, bc_cap, buf_cap,
-                             initial_incumbent=g_val, initial_x=x_g)
+                             initial_incumbent=g_val, initial_x=x_g,
+                             time_limit=60.0)
         r_bb_r = bnb_r.solve()
         print_solution(r_bb_r, banda, buffer, priority, bc_cap, buf_cap,
                        f"B&B | {label}")

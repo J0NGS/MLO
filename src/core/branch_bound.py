@@ -12,6 +12,7 @@ from .node import Node, NodeLog
 from .relaxation import solve_relaxation, LPResult
 
 
+# resultado final do solver; o que o b&b devolve pra quem chamou
 @dataclass
 class BBResult:
     status: str                      # "optimal", "infeasible", "timeout"
@@ -22,6 +23,7 @@ class BBResult:
     log: list[NodeLog] = field(default_factory=list)
 
 
+# motor de busca; não sabe nada sobre projetos, caixas ou rotas; só lida com o modelo
 class BranchAndBound:
     """
     Generic B&B engine.
@@ -62,6 +64,7 @@ class BranchAndBound:
     # ------------------------------------------------------------------
 
     def solve(self) -> BBResult:
+        # loop principal: cria a raiz, coloca na fila e processa nó a nó
         t0 = time.perf_counter()
 
         root = self._make_root()
@@ -122,6 +125,7 @@ class BranchAndBound:
     # ------------------------------------------------------------------
 
     def _make_root(self) -> Node:
+        # raiz usa os bounds originais; nenhum branching foi feito ainda
         self._node_counter = 0
         node = Node(
             id=0,
@@ -132,6 +136,7 @@ class BranchAndBound:
         return node
 
     def _make_queue(self):
+        # tipo da estrutura define a ordem de exploração da árvore
         if self.strategy == "dfs":
             return []           # use as stack (append/pop)
         elif self.strategy == "bfs":
@@ -146,7 +151,7 @@ class BranchAndBound:
             queue.append(node)
         else:
             import heapq
-            # Best-first: lowest lb for min, highest ub for max
+            # best-first: menor bound pra min, maior pra max
             priority = -(parent_lb or 0) if self.model.sense == "max" else (parent_lb or 0)
             heapq.heappush(queue, (priority, node.id, node))
 
@@ -161,6 +166,7 @@ class BranchAndBound:
             return node
 
     def _solve_node(self, node: Node) -> LPResult:
+        # relaxação do nó = modelo original com os bounds ajustados desse nó
         extra_lhs = np.array(node.cut_lhs) if node.cut_lhs else None
         extra_rhs = np.array(node.cut_rhs) if node.cut_rhs else None
         return solve_relaxation(self.model, extra_lhs, extra_rhs, node.bounds)
@@ -168,16 +174,17 @@ class BranchAndBound:
     def _process_node(self, node: Node, lp: LPResult) -> tuple[str, int]:
         """Returns (decision, cuts_added). Subclasses may override for B&C."""
         if lp.status == "infeasible":
+            # relaxação inviável = nenhuma solução inteira pode existir aqui
             return "pruned_infeasible", 0
 
-        # Prune by bound
+        # poda por bound; lp já é pior que o melhor inteiro conhecido
         if self._incumbent is not None:
             if self.model.sense == "min" and lp.obj_value >= self._incumbent - 1e-8:
                 return "pruned_bound", 0
             if self.model.sense == "max" and lp.obj_value <= self._incumbent + 1e-8:
                 return "pruned_bound", 0
 
-        # Check integrality
+        # solução do lp já é inteira — atualiza incumbente e não precisa ramificar
         if self._is_integer(lp.x):
             self._update_incumbent(lp.obj_value, lp.x)
             return "pruned_integer", 0
@@ -185,6 +192,7 @@ class BranchAndBound:
         return "branched", 0
 
     def _is_integer(self, x: np.ndarray, tol: float = 1e-5) -> bool:
+        # tolerância pra erro numérico — parte fracionária fora do intervalo (tol, 1-tol) é fracionária
         for i in self.model.integer_indices:
             frac = x[i] - math.floor(x[i])
             if tol < frac < 1 - tol:
@@ -203,6 +211,7 @@ class BranchAndBound:
             self._best_x = x.copy()
 
     def _pick_branch_var(self, x: np.ndarray) -> Optional[int]:
+        # escolhe qual variável fracionária vai ser dividida em dois subproblemas
         int_idx = self.model.integer_indices
         fracs = [(i, x[i] - math.floor(x[i])) for i in int_idx]
         fracs = [(i, f) for i, f in fracs if 1e-5 < f < 1 - 1e-5]
@@ -211,10 +220,11 @@ class BranchAndBound:
 
         if self.branching == "first_fractional":
             return fracs[0][0]
-        else:  # most_infeasible
+        else:  # most_infeasible — fração mais próxima de 0.5 gera dois filhos mais equilibrados
             return max(fracs, key=lambda t: min(t[1], 1 - t[1]))[0]
 
     def _branch(self, node: Node, x: np.ndarray) -> list[Node]:
+        # cria dois filhos: down → xj <= floor(v), up → xj >= ceil(v)
         var = self._pick_branch_var(x)
         if var is None:
             return []
