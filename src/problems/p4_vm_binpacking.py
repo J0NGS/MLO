@@ -32,6 +32,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from core import MIPModel, BranchAndBound, BranchAndCut, BBResult
 
 
+def print_cut_log(bc: BranchAndCut, label: str = "") -> None:
+    """Print a readable summary of all cuts generated during a B&C run."""
+    prefix = f"  [{label}] " if label else "  "
+    log = getattr(bc, "_cut_log", [])
+    if not log:
+        print(f"{prefix}Nenhum corte adicionado.")
+        return
+    by_type: dict[str, int] = {}
+    for entry in log:
+        by_type[entry["type"]] = by_type.get(entry["type"], 0) + 1
+    total = len(log)
+    summary = ", ".join(f"{t}={cnt}" for t, cnt in by_type.items())
+    print(f"{prefix}{total} corte(s) adicionado(s): {summary}")
+    for i, entry in enumerate(log, 1):
+        print(f"    Corte {i:3d}: tipo={entry['type']:<8} no={entry['node']:>4}  rhs={entry['rhs']:.4f}")
+
+
 # ------------------------------------------------------------------
 # Lower bound: LP relaxation of bin packing = ceil(sum_d / C)
 # ------------------------------------------------------------------
@@ -297,6 +314,8 @@ if __name__ == "__main__":
                           initial_incumbent=float(n_ffd), initial_x=x_ffd)
         r_bc = bc.solve()
         print_solution(r_bc, demands, cap, f"B&C | {label}", max_servers=k)
+        print("\nLog de cortes B&C:")
+        print_cut_log(bc, label=label)
 
         return r_bb, r_bc
 

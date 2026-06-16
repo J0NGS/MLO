@@ -20,6 +20,7 @@ class BranchAndCut(BranchAndBound):
         super().__init__(*args, **kwargs)
         self.cut_types = cut_types or ["gomory"]
         self.max_cut_rounds = max_cut_rounds
+        self._cut_log: list[dict] = []
 
     def _process_node(self, node: Node, lp: LPResult) -> tuple[str, int]:
         """Override: try cuts before declaring 'branched'."""
@@ -46,10 +47,11 @@ class BranchAndCut(BranchAndBound):
             if not new_cuts:
                 break
 
-            for lhs, rhs in new_cuts:
+            for cut_type, lhs, rhs in new_cuts:
                 node.cut_lhs.append(lhs)
                 node.cut_rhs.append(rhs)
                 total_cuts += 1
+                self._cut_log.append({"node": node.id, "type": cut_type, "rhs": float(rhs)})
 
             # Re-solve with new cuts
             test_lp = self._solve_node(node)
@@ -81,9 +83,9 @@ class BranchAndCut(BranchAndBound):
         node.lp_x = current_lp.x
         return "branched", total_cuts
 
-    def _generate_cuts(self, x: np.ndarray, node: Node, lp_result=None) -> list[tuple[np.ndarray, float]]:
-        """Run all enabled cut generators and return new violated cuts."""
-        cuts = []
+    def _generate_cuts(self, x: np.ndarray, node: Node, lp_result=None) -> list[tuple[str, np.ndarray, float]]:
+        """Run all enabled cut generators; return (cut_type, lhs, rhs) triples."""
+        cuts: list[tuple[str, np.ndarray, float]] = []
 
         # Build effective A_ub including cuts already at this node
         A_ub_eff = self.model.A_ub
@@ -101,10 +103,11 @@ class BranchAndCut(BranchAndBound):
         slack = lp_result.slack if lp_result is not None else None
 
         if "gomory" in self.cut_types:
-            cuts += gomory_cuts(x, self.model, A_ub_eff, b_ub_eff,
-                                slack=slack, node_bounds=node.bounds)
+            cuts += [("gomory", lhs, rhs)
+                     for lhs, rhs in gomory_cuts(x, self.model, A_ub_eff, b_ub_eff,
+                                                 slack=slack, node_bounds=node.bounds)]
 
         if "cover" in self.cut_types:
-            cuts += cover_cuts(x, self.model)
+            cuts += [("cover", lhs, rhs) for lhs, rhs in cover_cuts(x, self.model)]
 
         return cuts

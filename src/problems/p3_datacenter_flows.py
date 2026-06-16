@@ -19,6 +19,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from core import MIPModel, BranchAndBound, BranchAndCut, BBResult
+from core.relaxation import solve_relaxation
 
 
 # ------------------------------------------------------------------
@@ -64,7 +65,7 @@ def fractional_knapsack_bound(
 ) -> float:
     """
     Greedy fractional knapsack upper bound using priority/banda ratio.
-    Ignores the buffer constraint, so it is an optimistic (loose) bound.
+    Ignores the buffer constraint, so it is an optimistic (loose) upper bound.
     """
     items = sorted(
         range(len(banda)),
@@ -80,6 +81,36 @@ def fractional_knapsack_bound(
         bound += frac * priority[j]
         cap -= frac * banda[j]
     return bound
+
+
+def greedy_integer_solution(
+    banda: list[float],
+    buffer: list[float],
+    priority: list[float],
+    banda_cap: float,
+    buffer_cap: float,
+) -> tuple[float, np.ndarray]:
+    """
+    Greedy integer solution using priority/banda ratio.
+    Respects both bandwidth and buffer constraints (no fractional items).
+    Returns (total_priority, x_vector) — a feasible incumbent for B&B.
+    """
+    items = sorted(
+        range(len(banda)),
+        key=lambda j: priority[j] / banda[j],
+        reverse=True,
+    )
+    rem_banda  = float(banda_cap)
+    rem_buffer = float(buffer_cap)
+    x = np.zeros(len(banda))
+    total_priority = 0.0
+    for j in items:
+        if banda[j] <= rem_banda + 1e-9 and buffer[j] <= rem_buffer + 1e-9:
+            x[j] = 1.0
+            rem_banda  -= banda[j]
+            rem_buffer -= buffer[j]
+            total_priority += priority[j]
+    return total_priority, x
 
 
 # ------------------------------------------------------------------
@@ -147,31 +178,40 @@ if __name__ == "__main__":
     fk_bound = fractional_knapsack_bound(
         banda_orig, buffer_orig, priority_orig, banda_cap, buffer_cap
     )
+    greedy_val, x_greedy = greedy_integer_solution(
+        banda_orig, buffer_orig, priority_orig, banda_cap, buffer_cap
+    )
 
     print("=" * 65)
     print("PROBLEMA 3 - Instancia do enunciado (7 fluxos)")
     print(f"Banda cap={banda_cap} Mbps | Buffer cap={buffer_cap} MB")
-    print(f"Limitante fracionario (greedy banda): {fk_bound:.2f}")
+    print(f"Limitante superior fracionario (greedy razao p/b): {fk_bound:.2f}")
+    print(f"Solucao inicial greedy inteira (incumbente B&B):  {greedy_val:.2f}")
     print("=" * 65)
 
     model_orig = build_model(banda_orig, buffer_orig, priority_orig, banda_cap, buffer_cap)
 
-    print("\n--- Branch-and-Bound ---")
-    bb = BranchAndBound(model_orig, strategy="best_first", branching="most_infeasible")
+    lp_orig = solve_relaxation(model_orig)
+    lp_bound_orig = lp_orig.obj_value if lp_orig.status == "optimal" else None
+
+    print("\n--- Branch-and-Bound (warm-start: solucao greedy inteira) ---")
+    bb = BranchAndBound(model_orig, strategy="best_first", branching="most_infeasible",
+                        initial_incumbent=greedy_val, initial_x=x_greedy)
     r_bb = bb.solve()
     print_solution(r_bb, banda_orig, buffer_orig, priority_orig, banda_cap, buffer_cap,
                    "B&B | Instancia original")
 
-    print("\n--- Branch-and-Cut (cover cuts) ---")
+    print("\n--- Branch-and-Cut (cover cuts, warm-start: greedy inteira) ---")
     bc = BranchAndCut(model_orig, strategy="best_first", branching="most_infeasible",
-                      cut_types=["cover"])
+                      cut_types=["cover"],
+                      initial_incumbent=greedy_val, initial_x=x_greedy)
     r_bc = bc.solve()
     print_solution(r_bc, banda_orig, buffer_orig, priority_orig, banda_cap, buffer_cap,
                    "B&C | Instancia original")
 
     # ---- Random instances ----
     summary_rows = [
-        ("Original (7 fluxos)", r_bb, r_bc),
+        ("Original (7 fluxos)", r_bb, r_bc, lp_bound_orig),
     ]
 
     for n_flows, seed in [(10, 1), (20, 2), (50, 3)]:
@@ -188,31 +228,45 @@ if __name__ == "__main__":
         print("=" * 65)
 
         model_r = build_model(banda, buffer, priority, bc_cap, buf_cap)
+        lp_r = solve_relaxation(model_r)
+        lp_bound_r = lp_r.obj_value if lp_r.status == "optimal" else None
+
+        g_val_r, x_g_r = greedy_integer_solution(banda, buffer, priority, bc_cap, buf_cap)
 
         print("\n--- Branch-and-Bound ---")
-        bb_r = BranchAndBound(model_r, strategy="best_first", branching="most_infeasible")
+        bb_r = BranchAndBound(model_r, strategy="best_first", branching="most_infeasible",
+                               initial_incumbent=g_val_r if g_val_r > 0 else None,
+                               initial_x=x_g_r if g_val_r > 0 else None)
         r_bb_r = bb_r.solve()
         print_solution(r_bb_r, banda, buffer, priority, bc_cap, buf_cap,
                        f"B&B | {label}")
 
         print("\n--- Branch-and-Cut (cover cuts) ---")
         bc_r = BranchAndCut(model_r, strategy="best_first", branching="most_infeasible",
-                             cut_types=["cover"])
+                             cut_types=["cover"],
+                             initial_incumbent=g_val_r if g_val_r > 0 else None,
+                             initial_x=x_g_r if g_val_r > 0 else None)
         r_bc_r = bc_r.solve()
         print_solution(r_bc_r, banda, buffer, priority, bc_cap, buf_cap,
                        f"B&C | {label}")
 
-        summary_rows.append((label, r_bb_r, r_bc_r))
+        summary_rows.append((label, r_bb_r, r_bc_r, lp_bound_r))
 
     # ---- Summary ----
     print("\n--- Resumo das instancias ---")
-    print(f"{'Instancia':<25} {'B&B obj':>10} {'B&B nos':>9} {'B&C obj':>10} {'B&C nos':>9} {'Reducao':>9}")
-    print("-" * 80)
-    for label, rbb, rbc in summary_rows:
-        obj_bb = f"{rbb.obj_value:.1f}" if rbb.obj_value is not None else "N/A"
-        obj_bc = f"{rbc.obj_value:.1f}" if rbc.obj_value is not None else "N/A"
+    print(f"{'Instancia':<25} {'LP bound':>10} {'B&B obj':>10} {'Gap%':>7} {'B&B nos':>9} {'B&C obj':>10} {'B&C nos':>9} {'Reducao':>9}")
+    print("-" * 100)
+    for label, rbb, rbc, lp_bound in summary_rows:
+        obj_bb  = f"{rbb.obj_value:.1f}" if rbb.obj_value is not None else "N/A"
+        obj_bc  = f"{rbc.obj_value:.1f}" if rbc.obj_value is not None else "N/A"
+        lp_str  = f"{lp_bound:.2f}" if lp_bound is not None else "N/A"
+        if lp_bound is not None and rbb.obj_value is not None and abs(lp_bound) > 1e-8:
+            gap = abs(lp_bound - rbb.obj_value) / abs(lp_bound) * 100
+            gap_str = f"{gap:.1f}%"
+        else:
+            gap_str = "N/A"
         if rbb.nodes_explored > 0:
             reducao = f"{100*(1 - rbc.nodes_explored/rbb.nodes_explored):.1f}%"
         else:
             reducao = "N/A"
-        print(f"{label:<25} {obj_bb:>10} {rbb.nodes_explored:>9} {obj_bc:>10} {rbc.nodes_explored:>9} {reducao:>9}")
+        print(f"{label:<25} {lp_str:>10} {obj_bb:>10} {gap_str:>7} {rbb.nodes_explored:>9} {obj_bc:>10} {rbc.nodes_explored:>9} {reducao:>9}")

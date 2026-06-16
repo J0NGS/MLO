@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from problems.p6_network_coverage import (
     build_model, decode_solution, greedy_set_cover, greedy_to_x_vector,
-    random_instance, sensitivity_analysis,
+    random_instance, sensitivity_analysis, CoverageBC,
     DEFAULT_COSTS, DEFAULT_COVERAGE, N_ZONES, N_SITES, SITE_NAMES,
 )
 from core import BranchAndBound, BranchAndCut
@@ -21,7 +21,7 @@ def _verify_coverage(selected, coverage, n_zones):
 
 
 def test_instance_original():
-    """Optimal must be cost=10 with {A1, A2, A6} (indices 0, 1, 5)."""
+    """Optimal must be cost=230 with {L2, L3} (indices 1, 2)."""
     model = build_model(DEFAULT_COSTS, DEFAULT_COVERAGE, N_ZONES, SITE_NAMES)
 
     g_sel, g_cost = greedy_set_cover(DEFAULT_COSTS, DEFAULT_COVERAGE, N_ZONES)
@@ -32,17 +32,16 @@ def test_instance_original():
                             initial_incumbent=g_cost, initial_x=x_g).solve()
 
     assert result.status == "optimal"
-    assert abs(result.obj_value - 10.0) < 1e-4, f"Expected cost 10, got {result.obj_value}"
+    assert abs(result.obj_value - 230.0) < 1e-4, f"Expected cost 230, got {result.obj_value}"
 
     selected = decode_solution(result, N_SITES)
     _verify_coverage(selected, DEFAULT_COVERAGE, N_ZONES)
 
-    # Must include exactly 3 antenas; A1(0), A2(1), A6(5) is the unique min-cost solution
-    assert len(selected) == 3
-    assert set(selected) == {0, 1, 5}, (
-        f"Expected {{A1,A2,A6}} = {{0,1,5}}, got {{{','.join(SITE_NAMES[j] for j in selected)}}}"
+    # Must include {L2, L3} (indices 1, 2)
+    assert set(selected) == {1, 2}, (
+        f"Expected {{L2,L3}} = {{1,2}}, got {{{','.join(SITE_NAMES[j] for j in selected)}}}"
     )
-    print(f"PASS: instance_original | cost=10 | nodes={result.nodes_explored}")
+    print(f"PASS: instance_original | cost=230 | nodes={result.nodes_explored}")
 
 
 def test_bb_vs_bc_same_result():
@@ -54,18 +53,22 @@ def test_bb_vs_bc_same_result():
 
     r_bb = BranchAndBound(model, strategy="best_first",
                           initial_incumbent=g_cost, initial_x=x_g).solve()
-    r_bc = BranchAndCut(model, strategy="best_first", cut_types=["gomory"],
-                        initial_incumbent=g_cost, initial_x=x_g).solve()
+    bc_solver = CoverageBC(N_ZONES, N_SITES, DEFAULT_COVERAGE,
+                           model, strategy="best_first", cut_types=["gomory", "clique"],
+                           initial_incumbent=g_cost, initial_x=x_g)
+    r_bc = bc_solver.solve()
 
     assert r_bb.status == r_bc.status == "optimal"
     assert abs(r_bb.obj_value - r_bc.obj_value) < 1e-4, (
         f"B&B={r_bb.obj_value} != B&C={r_bc.obj_value}"
     )
-    # Both solutions must be feasible
     _verify_coverage(decode_solution(r_bb, N_SITES), DEFAULT_COVERAGE, N_ZONES)
     _verify_coverage(decode_solution(r_bc, N_SITES), DEFAULT_COVERAGE, N_ZONES)
+
+    clique_cuts = sum(1 for e in bc_solver._cut_log if e["type"] == "clique")
     print(f"PASS: bb_vs_bc | cost={r_bb.obj_value:.1f} | "
-          f"B&B nodes={r_bb.nodes_explored} | B&C nodes={r_bc.nodes_explored}")
+          f"B&B nodes={r_bb.nodes_explored} | B&C nodes={r_bc.nodes_explored} | "
+          f"clique cuts added={clique_cuts} (expected 0)")
 
 
 def test_greedy_is_upper_bound():
@@ -84,37 +87,46 @@ def test_greedy_is_upper_bound():
 
 def test_sensitivity_switch():
     """
-    Sensitivity on cost of A1 (site 0):
-    - c(A1) <= 5: {A1,A2,A6} is optimal  -> A1 selected
-    - c(A1) >= 7: {A3,A4,A6} is optimal  -> A1 NOT selected, cost=13 constant
+    Sensitivity on cost of L3 (site 2):
+    - c(L3) = 150: {L2,L3} is optimal, cost = 230
+    - c(L3) = 300: {L1,L4,L5} is optimal, cost = 320
     """
     sens = sensitivity_analysis(
-        cost_range=[1.0, 3.0, 5.0, 7.0, 9.0],
-        site_idx=0,
+        cost_range=[150.0, 300.0],
+        site_idx=2,
     )
 
-    for c_val, total, selected in sens:
-        assert total is not None, f"No solution at c(A1)={c_val}"
-        _verify_coverage(selected, DEFAULT_COVERAGE, N_ZONES)
+    (c150, total150, sel150), (c300, total300, sel300) = sens
 
-        if c_val <= 5.0:
-            # A1 must be in optimal (strictly cheaper to use it)
-            assert 0 in selected, (
-                f"c(A1)={c_val}: expected A1 selected, got {selected}"
-            )
-            assert abs(total - (c_val + 7.0)) < 1e-4, (
-                f"c(A1)={c_val}: expected cost {c_val+7}, got {total}"
-            )
-        elif c_val >= 7.0:
-            # A1 is too expensive; {A3,A4,A6} dominates
-            assert 0 not in selected, (
-                f"c(A1)={c_val}: A1 should NOT be selected, got {selected}"
-            )
-            assert abs(total - 13.0) < 1e-4, (
-                f"c(A1)={c_val}: expected fixed cost 13, got {total}"
-            )
+    assert total150 is not None and total300 is not None
+    _verify_coverage(sel150, DEFAULT_COVERAGE, N_ZONES)
+    _verify_coverage(sel300, DEFAULT_COVERAGE, N_ZONES)
 
-    print("PASS: sensitivity_switch | A1<=5: c1+7, A1>=7: 13 (A3+A4+A6)")
+    # At L3=150: {L2,L3} optimal, cost=230
+    assert set(sel150) == {1, 2}, f"c(L3)=150: expected {{L2,L3}}, got {sel150}"
+    assert abs(total150 - 230.0) < 1e-4, f"c(L3)=150: expected 230, got {total150}"
+
+    # At L3=300: {L1,L4,L5} optimal, cost=320
+    assert set(sel300) == {0, 3, 4}, f"c(L3)=300: expected {{L1,L4,L5}}, got {sel300}"
+    assert abs(total300 - 320.0) < 1e-4, f"c(L3)=300: expected 320, got {total300}"
+
+    print("PASS: sensitivity_switch | L3=150: {L2,L3}=230, L3=300: {L1,L4,L5}=320")
+
+
+def test_clique_cuts_never_violated():
+    """Clique cuts must never be violated by any LP relaxation solution."""
+    from problems.p6_network_coverage import zone_conflict_clique_cuts
+    from core.relaxation import solve_relaxation
+
+    model = build_model(DEFAULT_COSTS, DEFAULT_COVERAGE, N_ZONES, SITE_NAMES)
+    lp = solve_relaxation(model)
+    assert lp.status == "optimal"
+
+    cuts = zone_conflict_clique_cuts(lp.x, DEFAULT_COVERAGE, N_SITES, N_ZONES)
+    assert len(cuts) == 0, (
+        f"Expected 0 violated clique cuts, but got {len(cuts)}: {cuts}"
+    )
+    print(f"PASS: clique_cuts_never_violated | 0 violated cuts (LP relaxation satisfies all)")
 
 
 def test_random_instance_feasible():
@@ -147,5 +159,6 @@ if __name__ == "__main__":
     test_bb_vs_bc_same_result()
     test_greedy_is_upper_bound()
     test_sensitivity_switch()
+    test_clique_cuts_never_violated()
     test_random_instance_feasible()
     print("\nAll P6 tests passed!")
