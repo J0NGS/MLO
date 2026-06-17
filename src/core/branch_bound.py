@@ -328,11 +328,11 @@ class BranchAndBound:
             if prefix == "":
                 print(_fmt(e))
             else:
-                conn = "└──" if is_last else "├──"
+                conn = "`--" if is_last else "+--"
                 print(f"{prefix}{conn} {_fmt(e)}")
             children = kids.get(nid, [])
             for i, kid in enumerate(children):
-                ext = "    " if is_last else "│   "
+                ext = "    " if is_last else "|   "
                 _sub(kid, prefix + ext, i == len(children) - 1)
 
         _sub(0)
