@@ -23,7 +23,7 @@ class BBResult:
     log: list[NodeLog] = field(default_factory=list)
 
 
-# motor de busca; não sabe nada sobre projetos, caixas ou rotas; só lida com o modelo
+# motor de busca; não sabe nada sobre projetos, só lida com o modelo
 class BranchAndBound:
     """
     Generic B&B engine.
@@ -105,7 +105,7 @@ class BranchAndBound:
                 cuts_added=cuts_added,
             ))
 
-            self._print_node(node)
+            self._print_node(node, cuts_added)
 
             if decision == "branched":
                 # Use post-cut LP solution when available (B&C updates node.lp_x after cuts)
@@ -116,6 +116,8 @@ class BranchAndBound:
                     self._enqueue(queue, child, branch_obj)
 
         elapsed = time.perf_counter() - t0
+        if self.verbose:
+            self._print_tree()
         if self._incumbent is not None:
             return BBResult("optimal", self._incumbent, self._best_x, nodes_explored, elapsed, self._log)
         return BBResult("infeasible", None, None, nodes_explored, elapsed, self._log)
@@ -259,14 +261,75 @@ class BranchAndBound:
 
         return children
 
-    def _print_node(self, node: Node):
+    def _print_node(self, node: Node, cuts_added: int = 0):
         if not self.verbose:
             return
-        inc = f"{self._incumbent:.4f}" if self._incumbent is not None else "None"
-        lb = f"{node.lp_obj:.4f}" if node.lp_obj is not None else "None"
-        var_name = self.model.var_names[node.branch_var] if node.branch_var is not None else "root"
-        print(
-            f"[Node {node.id:4d}] depth={node.depth} | "
-            f"LP={lb} | incumbent={inc} | "
-            f"branch={var_name}({node.branch_dir}) | {node.decision}"
-        )
+        indent    = "    " * node.depth
+        inc       = f"{self._incumbent:.4f}" if self._incumbent is not None else "---"
+        lb        = f"{node.lp_obj:.4f}" if node.lp_obj is not None else "infeas"
+        if node.branch_var is not None:
+            branch = f"{self.model.var_names[node.branch_var]}({node.branch_dir[:2]})"
+        else:
+            branch = "raiz"
+        cuts_info = f" +{cuts_added}c" if cuts_added > 0 else ""
+        dec_map = {
+            "pruned_integer"    : "INT",
+            "pruned_bound"      : "BND",
+            "pruned_infeasible" : "INF",
+            "branched"          : "RAM",
+        }
+        dec = dec_map.get(node.decision, node.decision or "?")
+        print(f"{indent}[No {node.id:3d}] LP={lb:>8}  inc={inc}  "
+              f"{branch}{cuts_info}  =>  {dec}")
+
+    def _print_tree(self) -> None:
+        """Reconstroi e imprime a arvore B&B completa apos o solve."""
+        if not self._log:
+            return
+
+        by_id: dict[int, NodeLog] = {e.node_id: e for e in self._log}
+        kids : dict[int, list[int]] = {e.node_id: [] for e in self._log}
+        for e in self._log:
+            if e.parent_id is not None and e.parent_id in kids:
+                kids[e.parent_id].append(e.node_id)
+
+        # exibe filhos em ordem logica: down primeiro, up depois
+        for nid in kids:
+            kids[nid].sort(key=lambda cid: (by_id[cid].branch_dir or "", cid))
+
+        n    = len(self._log)
+        opt  = f"  otimo={self._incumbent:.4f}" if self._incumbent is not None else ""
+        print(f"\n{'=' * 60}")
+        print(f"  ARVORE B&B  ({n} nos{opt})")
+        print("=" * 60)
+
+        dec_map = {
+            "pruned_integer"    : "INT",
+            "pruned_bound"      : "BND",
+            "pruned_infeasible" : "INF",
+            "branched"          : "RAM",
+        }
+
+        def _fmt(e: NodeLog) -> str:
+            lb    = f"{e.lp_obj:.4f}" if e.lp_obj is not None else "infeas"
+            inc   = f"{e.best_incumbent:.4f}" if e.best_incumbent is not None else "---"
+            bname = e.branch_var_name or "raiz"
+            bdir  = f"({e.branch_dir[:2]})" if e.branch_dir else ""
+            cuts  = f" +{e.cuts_added}c" if e.cuts_added else ""
+            dec   = dec_map.get(e.decision, e.decision or "?")
+            return f"[No {e.node_id:3d}] LP={lb:>8}  inc={inc}  {bname}{bdir}{cuts}  {dec}"
+
+        def _sub(nid: int, prefix: str = "", is_last: bool = True) -> None:
+            e = by_id[nid]
+            if prefix == "":
+                print(_fmt(e))
+            else:
+                conn = "└──" if is_last else "├──"
+                print(f"{prefix}{conn} {_fmt(e)}")
+            children = kids.get(nid, [])
+            for i, kid in enumerate(children):
+                ext = "    " if is_last else "│   "
+                _sub(kid, prefix + ext, i == len(children) - 1)
+
+        _sub(0)
+        print()

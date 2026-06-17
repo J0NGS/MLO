@@ -1,8 +1,7 @@
 from __future__ import annotations
 import numpy as np
 from scipy.optimize import linprog, OptimizeResult
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 from .model import MIPModel
 
@@ -25,8 +24,11 @@ def solve_relaxation(
 ) -> LPResult:
     """Solve LP relaxation of model, optionally with extra cuts and tightened bounds."""
 
+    # em problemas de max, o model.effective_c() inverte o sinal.
     c = model.effective_c()
 
+    # monta A_ub/b_ub efetivos combinando as restrições originais do modelo
+    # com cortes adicionais (se houver) vindos do branch-and-cut.
     A_ub_parts, b_ub_parts = [], []
     if model.A_ub is not None:
         A_ub_parts.append(model.A_ub)
@@ -38,8 +40,11 @@ def solve_relaxation(
     A_ub = np.vstack(A_ub_parts) if A_ub_parts else None
     b_ub = np.concatenate(b_ub_parts) if b_ub_parts else None
 
+    # limites ativos da variável no nó atual; se não houver bounds do nó,
+    # usa os bounds globais definidos no modelo.
     bounds = node_bounds if node_bounds is not None else model.bounds
     ## ----------------------------------------------------------
+    # resolve a relaxação LP
     result: OptimizeResult = linprog(
         c,
         A_ub=A_ub,
@@ -51,7 +56,11 @@ def solve_relaxation(
     )
     ## ----------------------------------------------------------
 
+    # mapeamento dos status do HiGHS para o contrato interno LPResult:
+    # 0 = ótimo, 2 = inviável, 3 = ilimitado.
     if result.status == 0:
+        # result.fun está no espaço transformado (min). para modelos de max,
+        # convertemos de volta para o valor objetivo no sentido original.
         raw_obj = float(result.fun)
         obj = raw_obj if model.sense == "min" else -raw_obj
         slack = result.slack if hasattr(result, "slack") else None

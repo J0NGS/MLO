@@ -1,5 +1,6 @@
 """Branch-and-Cut: extends BranchAndBound with automatic cut generation."""
 from __future__ import annotations
+import math
 import numpy as np
 
 from .branch_bound import BranchAndBound
@@ -20,11 +21,11 @@ class BranchAndCut(BranchAndBound):
     def __init__(self, *args, cut_types: list[str] | None = None, max_cut_rounds: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
         # estratégias de exploração herdadas do b&b (parâmetro strategy):
-        #   dfs        ; pilha (lifo); vai fundo antes de voltar; usa menos memória; bom pra achar incumbente rápido
-        #   bfs        ; fila (fifo); explora nível por nível; guarda muitos nós em memória
+        #   dfs        ; pilha (lifo);
+        #   bfs        ; fila (fifo);
         #   best_first ; heap de prioridade; sempre processa o nó com melhor bound lp; mais eficiente na prática
         #              ; no best_first: pra min, prioridade = menor obj do pai; pra max, prioridade = maior obj do pai
-        #              ; isso garante que os nós mais promissores sejam explorados antes; menos podas desperdiçadas
+        #              ; isso garante que os nós mais promissores sejam explorados antes;
         self.cut_types = cut_types or ["gomory"]  # quais geradores de corte usar
         self.max_cut_rounds = max_cut_rounds       # quantas rodadas de corte por nó no máximo
         self._cut_log: list[dict] = []
@@ -49,9 +50,10 @@ class BranchAndCut(BranchAndBound):
         total_cuts = 0
         current_lp = lp
 
-        for _ in range(self.max_cut_rounds):
+        for round_num in range(1, self.max_cut_rounds + 1):
             n_before = len(node.cut_lhs)
-            new_cuts = self._generate_cuts(current_lp.x, node, current_lp)
+            cut_details = [] if self.verbose else None
+            new_cuts = self._generate_cuts(current_lp.x, node, current_lp, cut_details=cut_details)
             if not new_cuts:
                 # ponto de decisão; nenhum corte útil encontrado; sai do loop e vai ramificar
                 break
@@ -62,6 +64,9 @@ class BranchAndCut(BranchAndBound):
                 node.cut_rhs.append(rhs)
                 total_cuts += 1
                 self._cut_log.append({"node": node.id, "type": cut_type, "rhs": float(rhs)})
+
+            if self.verbose and cut_details:
+                self._print_cuts(cut_details, node, round_num)
 
             # re-resolve o lp com os novos cortes; tenta apertar o bound antes de ramificar
             test_lp = self._solve_node(node)
@@ -94,7 +99,7 @@ class BranchAndCut(BranchAndBound):
         node.lp_x = current_lp.x
         return "branched", total_cuts
 
-    def _generate_cuts(self, x: np.ndarray, node: Node, lp_result=None) -> list[tuple[str, np.ndarray, float]]:
+    def _generate_cuts(self, x: np.ndarray, node: Node, lp_result=None, cut_details: list | None = None) -> list[tuple[str, np.ndarray, float]]:
         """Run all enabled cut generators; return (cut_type, lhs, rhs) triples."""
         cuts: list[tuple[str, np.ndarray, float]] = []
 
@@ -117,10 +122,122 @@ class BranchAndCut(BranchAndBound):
             # gomory; derivado da tabela do simplex; corta a solução fracionária sem remover inteiros válidos
             cuts += [("gomory", lhs, rhs)
                      for lhs, rhs in gomory_cuts(x, self.model, A_ub_eff, b_ub_eff,
-                                                 slack=slack, node_bounds=node.bounds)]
+                                                 slack=slack, node_bounds=node.bounds,
+                                                 cut_details=cut_details)]
 
         if "cover" in self.cut_types:
             # cover; detecta subconjuntos de variáveis binárias que somam mais que a capacidade; específico pra knapsack
-            cuts += [("cover", lhs, rhs) for lhs, rhs in cover_cuts(x, self.model)]
+            new_cover = list(cover_cuts(x, self.model))
+            cuts += [("cover", lhs, rhs) for lhs, rhs in new_cover]
+            if cut_details is not None:
+                var_names = self.model.var_names
+                n = len(x)
+                for lhs, rhs in new_cover:
+                    cut_details.append({
+                        "type": "cover",
+                        "cut_lhs": lhs.copy(),
+                        "cut_rhs": float(rhs),
+                        "violation": float(lhs @ x - rhs),
+                    })
 
         return cuts
+
+    # ------------------------------------------------------------------
+    # Logging de cortes (verbose)
+    # ------------------------------------------------------------------
+
+    def _print_cuts(self, cut_details: list, node: Node, round_num: int):
+        pad = "    " * node.depth
+        n_gomory = sum(1 for d in cut_details if d.get("type") == "gomory")
+        n_cover  = sum(1 for d in cut_details if d.get("type") == "cover")
+        n_total  = n_gomory + n_cover
+        var_names = self.model.var_names
+        n = len(self.model.c)
+        print(f"\n{pad}    [B&C] No {node.id} - rodada {round_num}: {n_total} corte(s)  "
+              f"[{n_gomory} Gomory, {n_cover} Cover]")
+        for d in cut_details:
+            t = d.get("type")
+            if t == "gomory_tableau":
+                self._print_gomory_tableau(d, pad=pad)
+            elif t == "gomory":
+                self._print_gomory_cut(d, var_names, n, pad=pad)
+            elif t == "cover":
+                self._print_cover_cut(d, var_names, n, pad=pad)
+
+    def _print_gomory_tableau(self, d: dict, pad: str = ""):
+        var_names = d["var_names"]
+        n         = d["n_orig"]
+        m         = d["m_slack"]
+        tableau   = d["full_tableau"]
+        basic_idx = d["basic_idx"]
+        x_B       = d["x_B"]
+        frac_set  = {k for k, _ in d["frac_rows"]}
+        p         = pad + "    "
+
+        def var_label(idx: int) -> str:
+            if idx < n:
+                return var_names[idx] if idx < len(var_names) else f"x{idx}"
+            return f"s{idx - n + 1}"
+
+        col_labels = [var_names[j] if j < len(var_names) else f"x{j}" for j in range(n)]
+        col_labels += [f"s{j + 1}" for j in range(m)]
+        col_w  = max(8, max((len(l) for l in col_labels), default=4) + 2)
+        base_w = max(8, max((len(var_label(bi)) + 2 for bi in basic_idx), default=6))
+
+        print(f"{p}Tableau simplex (solucao fracionaria):")
+        header = f"{p}{'Base':<{base_w}} {'Valor':>10} {'Fracao':>8}  |"
+        for l in col_labels:
+            header += f"  {l:>{col_w}}"
+        print(header)
+        sep = f"{p}{'-' * base_w} {'-' * 10} {'-' * 8}  +"
+        for _ in col_labels:
+            sep += "-" * (col_w + 2)
+        print(sep)
+
+        for k, bi in enumerate(basic_idx):
+            marker = "*" if k in frac_set else " "
+            label  = var_label(bi) + marker
+            val    = x_B[k]
+            f_val  = val - math.floor(val)
+            f_str  = f"{f_val:.6f}" if k in frac_set else "    -   "
+            row = f"{p}{label:<{base_w}} {val:>10.6f} {f_str:>8}  |"
+            for j in range(n + m):
+                row += f"  {tableau[k, j]:>{col_w}.4f}"
+            print(row)
+
+        if frac_set:
+            print(f"{p}(* variavel inteira fracionaria => gera corte de Gomory)")
+        print()
+
+    def _print_gomory_cut(self, d: dict, var_names: list, n: int, pad: str = ""):
+        var_name  = d["var_name"]
+        xB_k      = d["xB_k"]
+        f_k       = d["f_k"]
+        cut_lhs   = d["cut_lhs"]
+        cut_rhs   = d["cut_rhs"]
+        violation = d["violation"]
+        p         = pad + "    "
+
+        nonzero = [(j, cut_lhs[j]) for j in range(n) if abs(cut_lhs[j]) > 1e-8]
+        terms = "  ".join(
+            f"({c:+.4f})*{var_names[j] if j < len(var_names) else f'x{j}'}"
+            for j, c in nonzero
+        ) if nonzero else "0"
+
+        print(f"{p}>> Gomory  ({var_name} = {xB_k:.6f},  f = {f_k:.6f}):")
+        print(f"{p}   {terms}  <=  {cut_rhs:.6f}")
+        print(f"{p}   violacao: {violation:.6f}")
+        print()
+
+    def _print_cover_cut(self, d: dict, var_names: list, n: int, pad: str = ""):
+        cut_lhs   = d["cut_lhs"]
+        cut_rhs   = d["cut_rhs"]
+        violation = d["violation"]
+        p         = pad + "    "
+        cover_vars = [
+            var_names[j] if j < len(var_names) else f"x{j}"
+            for j in range(n) if cut_lhs[j] > 0.5
+        ]
+        print(f"{p}>> Cover: {' + '.join(cover_vars)}  <=  {cut_rhs:.0f}")
+        print(f"{p}   violacao: {violation:.6f}")
+        print()

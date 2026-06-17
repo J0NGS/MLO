@@ -320,25 +320,33 @@ def decode_tour(result: BBResult, n: int) -> list[int] | None:
 
 class TSPBranchAndCut(BranchAndCut):
     """
-    B&C for TSP that detects subtours in the LP solution and adds the
-    violated SEC as a cut. Starts from the degree-only model and adds
-    SECs lazily, mimicking the classic B&C approach for TSP.
+    B&C for TSP com dois modos:
 
-    Key override: _is_integer() returns False for integer solutions that still
-    contain subtours, so the cut loop runs and adds the missing SECs before
-    any subtour-invalid solution is accepted as an incumbent.
+    mtz_mode=False (padrao): parte do modelo de grau sem SECs; adiciona
+        cortes DFJ (subtour) e Gomory lazily. Precisa de _is_valid_tour
+        porque o modelo base nao tem garantia de tour valido em solucoes
+        inteiras.
+
+    mtz_mode=True: parte do modelo MTZ, que ja elimina subtours em
+        solucoes inteiras pelas restricoes u_i - u_j + n*x_{ij} <= n-1.
+        Adiciona cortes Gomory (e opcionalmente DFJ) sobre a relaxacao
+        MTZ. Nao precisa de _is_valid_tour.
     """
 
-    def __init__(self, n_cities: int, *args, **kwargs):
+    def __init__(self, n_cities: int, *args, mtz_mode: bool = False, **kwargs):
         self.n_cities = n_cities
+        self.mtz_mode = mtz_mode
         super().__init__(*args, **kwargs)
 
-    # --- Integrality check: reject solutions with subtours ---
+    # --- Integrality check ---
 
     def _is_integer(self, x: np.ndarray, tol: float = 1e-5) -> bool:
-        """Return True only when x is integer AND forms a valid Hamiltonian tour."""
+        """MTZ mode: integridade suficiente (MTZ garante tour valido).
+        DFJ mode: rejeita solucoes inteiras com subtours."""
         if not super()._is_integer(x, tol):
             return False
+        if self.mtz_mode:
+            return True  # restricoes MTZ garantem tour valido para solucoes inteiras
         return self._is_valid_tour(x)
 
     def _is_valid_tour(self, x: np.ndarray) -> bool:
@@ -367,29 +375,31 @@ class TSPBranchAndCut(BranchAndCut):
         x: np.ndarray,
         node: Node,
         lp_result=None,
+        cut_details: list | None = None,
     ) -> list[tuple[str, np.ndarray, float]]:
-        # Standard cuts (Gomory, etc.) from parent — already tagged
-        cuts = super()._generate_cuts(x, node, lp_result)
-        # Lazy subtour elimination cuts
+        cuts = super()._generate_cuts(x, node, lp_result, cut_details=cut_details)
         if "subtour" in self.cut_types:
             cuts += self._subtour_cuts(x)
         return cuts
 
     def _subtour_cuts(self, x: np.ndarray) -> list[tuple[str, np.ndarray, float]]:
         """
-        Detect subtours via connected components of the support graph
-        (edges with x_{ij} > 0.5). For each proper component S found,
-        add the violated SEC: sum_{i,j in S, i!=j} x_{ij} <= |S|-1.
+        Detecta subtours via componentes conexas do grafo suporte
+        (arcos com x_{ij} > 0.5). Para cada componente propria S,
+        adiciona a SEC violada: sum_{i,j in S, i!=j} x_{ij} <= |S|-1.
+
+        O vetor cut_lhs tem dimensao len(x) para ser compativel tanto
+        com o modelo DFJ (n*n variaveis) quanto com o MTZ (n*n + (n-1)).
         """
         n = self.n_cities
-        # Support graph: directed arcs with x > 0.5 (near-integer threshold)
+        n_vars = len(x)  # compativel com DFJ e MTZ
+
         succ: list[list[int]] = [[] for _ in range(n)]
         for i in range(n):
             for j in range(n):
                 if i != j and x[idx(i, j, n)] > 0.5:
                     succ[i].append(j)
 
-        # Find weakly-connected components (ignore arc direction)
         visited = [False] * n
         components: list[list[int]] = []
         for start in range(n):
@@ -411,13 +421,13 @@ class TSPBranchAndCut(BranchAndCut):
                 components.append(comp)
 
         if len(components) <= 1:
-            return []  # No subtour detected
+            return []
 
         cuts: list[tuple[str, np.ndarray, float]] = []
         for comp in components:
-            if len(comp) < n:  # Proper subset = subtour
+            if len(comp) < n:
                 S = comp
-                cut_lhs = np.zeros(n * n)
+                cut_lhs = np.zeros(n_vars)  # zeros nas vars u para modelo MTZ
                 for i in S:
                     for j in S:
                         if i != j:
@@ -542,22 +552,29 @@ if __name__ == "__main__":
     r_bb = bb.solve()
     print_solution(r_bb, DEFAULT_DIST, N, label="B&B MTZ | Instancia original", city_names=cn)
 
-    # B&C with lazy DFJ SECs
-    model_degree = build_model(DEFAULT_DIST, N, include_secs=False)
-    print(f"\n(Modelo lazy DFJ: apenas restricoes de grau, SECs adicionadas como cortes)")
+    # B&C com relaxacao MTZ em cada no (alinhado ao enunciado)
+    # Modelo base: MTZ (grau + restricoes u_i - u_j + n*x_ij <= n-1)
+    # Cortes: Gomory sobre a relaxacao MTZ + SECs DFJ lazily
+    # mtz_mode=True: _is_integer nao precisa verificar tour valido
+    #   (as restricoes MTZ garantem isso para solucoes inteiras)
+    x_nn_mtz_bc = np.zeros(N * N + (N - 1))
+    x_nn_mtz_bc[:N * N] = x_nn
 
-    print("\n--- Branch-and-Cut (SECs lazy DFJ + Gomory) ---")
-    bc = TSPBranchAndCut(N, model_degree, strategy="best_first",
+    print(f"\n(Modelo MTZ: relaxacao MTZ em cada no, cortes Gomory + SECs DFJ lazy)")
+    print("\n--- Branch-and-Cut (relaxacao MTZ + Gomory + SECs lazy) ---")
+    bc = TSPBranchAndCut(N, model_mtz, strategy="best_first",
                          branching="most_infeasible",
-                         cut_types=["subtour", "gomory"],
-                         initial_incumbent=nn_cost, initial_x=x_nn)
+                         mtz_mode=True,
+                         cut_types=["gomory", "subtour"],
+                         initial_incumbent=nn_cost, initial_x=x_nn_mtz_bc)
     r_bc = bc.solve()
-    print_solution(r_bc, DEFAULT_DIST, N, label="B&C lazy | Instancia original", city_names=cn)
+    print_solution(r_bc, DEFAULT_DIST, N, label="B&C MTZ | Instancia original", city_names=cn)
 
-    print(f"\nB&B (MTZ) nos={r_bb.nodes_explored} | B&C (DFJ lazy) nos={r_bc.nodes_explored}")
+    print(f"\nB&B (MTZ) nos={r_bb.nodes_explored} | B&C (MTZ + cortes) nos={r_bc.nodes_explored}")
     if bc._cut_log:
         subtour_cuts = sum(1 for e in bc._cut_log if e["type"] == "subtour")
-        print(f"Cortes SEC adicionados pelo B&C: {subtour_cuts}")
+        gomory_cuts  = sum(1 for e in bc._cut_log if e["type"] == "gomory")
+        print(f"Cortes adicionados pelo B&C: {gomory_cuts} Gomory, {subtour_cuts} SEC")
 
     # ---- Sensitivity: vary d[E0][E2] ----
     print("\n" + "=" * 65)

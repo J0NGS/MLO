@@ -1,283 +1,456 @@
 """
-Problema 9 - Empacotamento de Caixas (Bin Packing) [PIB]
+Problema 9 - Empacotamento de Caixas (Bin Packing) via Geracao de Colunas e Branch-and-Price
 
-Uma transportadora precisa empacotar n itens em caixas identicas
-de capacidade B, minimizando o numero de caixas utilizadas.
+Formulacao por Geracao de Colunas (modelo de padroes):
 
-Formulacao PIB:
-    min  sum_j y_j
-    s.t.
-    (1)  sum_j x_{ij} = 1               para cada item i      (atribuicao unica)
-    (2)  sum_i w_i * x_{ij} <= B * y_j  para cada caixa j     (capacidade)
-    (3)  y_j <= y_{j-1}                 para j = 1..n-1       (quebra de simetria)
-    (4)  y_j, x_{ij} in {0, 1}                                (PIB puro)
+  Padroes: subconjuntos P de itens com sum_{i in P} w_i <= B
+  Variavel z_p = 1 se o padrao p e usado, 0 c.c.
 
-Variaveis (n_bins + n_items*n_bins variaveis):
-    y_j    -> j                         (j = 0..n_bins-1)
-    x_{ij} -> n_bins + i*n_bins + j     (i = 0..n_items-1)
+  PMR (Problema Mestre Restrito — relaxacao LP):
+    min  sum_p z_p
+    s.t. sum_p a_{ip} * z_p = 1    para cada item i   (set partition)
+         z_p >= 0
 
-Instancia (6 itens, capacidade B=10):
-    Pesos: [6, 4, 4, 3, 3, 2]   soma = 22
-    Limite inferior: ceil(22/10) = 3 caixas
+  Subproblema de precificacao (mochila 0-1):
+    max  sum_i pi_i * a_i
+    s.t. sum_i w_i * a_i <= B,  a_i in {0,1}
+  Custo reduzido do candidato: rc = 1 - max_knap.  Adiciona se rc < 0.
 
-    Otimo: 3 caixas
-        B1: {I1(6), I2(4)}       = 10
-        B2: {I3(4), I4(3), I5(3)}= 10
-        B3: {I6(2)}              =  2
+  Branch-and-Price (B&P):
+    B&B sobre PMR inteiro; em cada no re-resolve por CG.
+    Ramifica em z_p mais fracionario (z_p <= floor | z_p >= ceil).
 
-Heuristica FFD (First-Fit Decreasing):
-    Ordena decrescente: [6,4,4,3,3,2]
-    B1: 6 -> 6+2=8 (cabe 2); B2: 4+4=8; B3: 3+3=6.  -> 3 caixas (=otimo)
-    NOTA: para B=11, FFD da 3 mas otimo e 2 (FFD e subotimo!).
-
-Analise de sensibilidade (capacidade B em [6..13]):
-    B =  6, 7  -> 4 caixas  (3*7=21 < 22 = soma)
-    B =  8..10 -> 3 caixas
-    B = 11..13 -> 2 caixas  (B=11: {6,3,2},{4,4,3}; mas FFD da 3 - subotimo!)
+Instancia (6 itens, B=10):
+  Pesos: [6, 4, 4, 3, 3, 2]   soma = 22
+  LB trivial: ceil(22/10) = 3 caixas
+  Otimo: 3 caixas  {I1,I2} {I3,I4,I5} {I6}
 """
 from __future__ import annotations
 import math
 import sys, os
 import numpy as np
+from scipy.optimize import linprog
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from core import MIPModel, BranchAndBound, BranchAndCut, BBResult
 
 
 # ------------------------------------------------------------------
-# Default instance
+# Instancia padrao
 # ------------------------------------------------------------------
 
 N_ITEMS = 6
-N_BINS  = 6   # at most n_items bins ever needed
-
 ITEM_NAMES = [f"I{i+1}" for i in range(N_ITEMS)]
-BIN_NAMES  = [f"B{j+1}" for j in range(N_BINS)]
-
-DEFAULT_WEIGHTS:  list[float] = [6.0, 4.0, 4.0, 3.0, 3.0, 2.0]
-DEFAULT_CAPACITY: float       = 10.0
+DEFAULT_WEIGHTS: list[float] = [6.0, 4.0, 4.0, 3.0, 3.0, 2.0]
+DEFAULT_CAPACITY: float = 10.0
 
 
 # ------------------------------------------------------------------
-# Variable index helpers
+# Auxiliares de padroes
 # ------------------------------------------------------------------
 
-def iy(j: int, n_bins: int) -> int:
-    """Index of binary variable y_j (bin j is open)."""
-    return j
+def pattern_label(pat: tuple, item_names: list[str]) -> str:
+    return "+".join(item_names[i] for i in sorted(pat))
 
-def ix(i: int, j: int, n_bins: int) -> int:
-    """Index of binary variable x_{ij} (item i in bin j)."""
-    return n_bins + i * n_bins + j
+
+def generate_all_feasible_patterns(weights: list[float], capacity: float) -> list[tuple]:
+    """Enumera todos os padroes viaveis por forca bruta (2^n subconjuntos)."""
+    n = len(weights)
+    patterns = []
+    for mask in range(1, 1 << n):
+        items = tuple(i for i in range(n) if mask & (1 << i))
+        if sum(weights[i] for i in items) <= capacity + 1e-9:
+            patterns.append(items)
+    return patterns
 
 
 # ------------------------------------------------------------------
-# Model builder
+# Subproblema de precificacao: mochila 0-1 (DP exato)
 # ------------------------------------------------------------------
 
-def build_model(
+def knapsack_dp(
+    profits: list[float],
     weights: list[float],
     capacity: float,
-    n_bins: int | None = None,
-    item_names: list[str] | None = None,
-    bin_names: list[str] | None = None,
-) -> MIPModel:
+) -> tuple[float, list[int]]:
     """
-    Build Bin Packing MIPModel with symmetry-breaking constraints.
-
-    All variables are binary (PIB puro).
+    Mochila 0-1 por programacao dinamica.
+    Assume capacidade e pesos inteiros (arredondados internamente).
+    Retorna (valor_maximo, lista_de_itens_selecionados).
     """
-    n_items = len(weights)
-    if n_bins is None:
-        n_bins = n_items   # worst case: one item per bin
-    if item_names is None:
-        item_names = [f"i{i+1}" for i in range(n_items)]
-    if bin_names is None:
-        bin_names = [f"b{j+1}" for j in range(n_bins)]
+    n = len(profits)
+    cap = int(round(capacity))
+    int_w = [int(round(w)) for w in weights]
 
-    n_vars = n_bins + n_items * n_bins
+    # dp[i][c] = max lucro usando itens 0..i-1 com capacidade c
+    dp = np.zeros((n + 1, cap + 1))
+    for i in range(1, n + 1):
+        w = int_w[i - 1]
+        p = max(profits[i - 1], 0.0)   # lucro negativo: nao ajuda
+        dp[i] = dp[i - 1].copy()
+        for c in range(w, cap + 1):
+            val = dp[i - 1][c - w] + p
+            if val > dp[i][c] + 1e-10:
+                dp[i][c] = val
 
-    # Objective: minimize number of open bins
-    c = [0.0] * n_vars
-    for j in range(n_bins):
-        c[iy(j, n_bins)] = 1.0
+    # Backtrack
+    items: list[int] = []
+    c = cap
+    for i in range(n, 0, -1):
+        w = int_w[i - 1]
+        if w <= c and dp[i][c] > dp[i - 1][c] + 1e-10:
+            items.append(i - 1)
+            c -= w
 
-    bounds = [(0.0, 1.0)] * n_vars
-    integrality = [2] * n_vars   # all binary
-
-    A_ub, b_ub = [], []
-
-    # (2) Capacity: sum_i w_i x_{ij} - B y_j <= 0
-    for j in range(n_bins):
-        row = [0.0] * n_vars
-        for i in range(n_items):
-            row[ix(i, j, n_bins)] = float(weights[i])
-        row[iy(j, n_bins)] = -float(capacity)
-        A_ub.append(row)
-        b_ub.append(0.0)
-
-    # (3) Symmetry breaking: y_j - y_{j-1} <= 0
-    for j in range(1, n_bins):
-        row = [0.0] * n_vars
-        row[iy(j - 1, n_bins)] = -1.0
-        row[iy(j, n_bins)]     =  1.0
-        A_ub.append(row)
-        b_ub.append(0.0)
-
-    # (1) Assignment: sum_j x_{ij} = 1
-    A_eq, b_eq = [], []
-    for i in range(n_items):
-        row = [0.0] * n_vars
-        for j in range(n_bins):
-            row[ix(i, j, n_bins)] = 1.0
-        A_eq.append(row)
-        b_eq.append(1.0)
-
-    var_names  = list(bin_names)
-    var_names += [f"x{item_names[i]}{bin_names[j]}"
-                  for i in range(n_items) for j in range(n_bins)]
-
-    return MIPModel(
-        c=c, A_ub=A_ub, b_ub=b_ub,
-        A_eq=A_eq, b_eq=b_eq,
-        bounds=bounds, integrality=integrality,
-        sense="min",
-        var_names=var_names,
-    )
+    return float(dp[n][cap]), items
 
 
 # ------------------------------------------------------------------
-# First-Fit Decreasing heuristic
+# LP do PMR
 # ------------------------------------------------------------------
 
-def ffd_assignment(
+def solve_pmr_lp(
+    patterns: list[tuple],
+    n_items: int,
+    lb_z: list[float] | None = None,
+    ub_z: list[float] | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, float | None]:
+    """
+    Resolve a relaxacao LP do PMR (formulacao set partition):
+
+      min 1^T z  s.t.  A z = 1,  z >= 0
+
+    Cada item deve aparecer em EXATAMENTE um padrao ativo (=, nao >=).
+    Garante que a solucao inteira do B&P seja um empacotamento valido.
+
+    Duals: pi = result.eqlin.marginals  (sem restricao de sinal)
+      - pi_i e o preco-sombra de "cobrir o item i exatamente uma vez"
+      - Custo reduzido do padrao p: rc_p = 1 - sum_i a_{ip} pi_i
+      - Adiciona p se rc_p < 0  (equivalente: max_knap > 1)
+
+    Retorna (z_vals, pi, obj) ou (None, None, None) se infeasivel.
+    """
+    n_p = len(patterns)
+
+    # A[i, p] = 1 se item i esta no padrao p
+    A = np.zeros((n_items, n_p))
+    for p_idx, pat in enumerate(patterns):
+        for i in pat:
+            A[i, p_idx] = 1.0
+
+    bounds = []
+    for p in range(n_p):
+        lb = lb_z[p] if lb_z is not None and p < len(lb_z) else 0.0
+        ub = ub_z[p] if ub_z is not None and p < len(ub_z) else None
+        bounds.append((lb, ub))
+
+    # set partition: A z = 1  (igualdade, nao desigualdade)
+    result = linprog(np.ones(n_p), A_eq=A, b_eq=np.ones(n_items),
+                     bounds=bounds, method="highs")
+
+    if result.status != 0:
+        return None, None, None
+
+    duals = np.asarray(result.eqlin.marginals)  # sem restricao de sinal
+    return result.x, duals, float(result.fun)
+
+
+# ------------------------------------------------------------------
+# Loop de geracao de colunas
+# ------------------------------------------------------------------
+
+def column_generation(
     weights: list[float],
     capacity: float,
-) -> tuple[dict[int, int], int]:
+    patterns: list[tuple] | None = None,
+    lb_z: list[float] | None = None,
+    ub_z: list[float] | None = None,
+    verbose: bool = True,
+) -> tuple[list[tuple], np.ndarray | None, np.ndarray | None, float | None]:
     """
-    First-Fit Decreasing heuristic.
-    Returns (item_bin_map, n_bins_used) where item_bin_map[i] = j.
+    Geracao de colunas para o PMR de bin packing.
+
+    Cada iteracao:
+      1. Resolve LP do PMR com os padroes atuais
+      2. Extrai duais pi_i
+      3. Resolve subproblema de mochila: max sum_i pi_i a_i s.t. sum_i w_i a_i <= B
+      4. Se max > 1 (rc < 0): adiciona novo padrao e repete
+         Senao: LP e otimo (sem coluna de custo reduzido negativo)
+
+    Inicializa com padroes singleton se nenhum for fornecido.
+    Retorna (patterns, z_vals, duals, obj) ou (None, None, None, None) se infeasivel.
     """
+    n = len(weights)
+    inames = [f"I{i+1}" for i in range(n)]
+
+    if patterns is None:
+        patterns = [(i,) for i in range(n)]   # singletons: 1 item por caixa
+    else:
+        patterns = list(patterns)
+
+    # Garante lb_z/ub_z com comprimento suficiente
+    if lb_z is not None:
+        lb_z = list(lb_z) + [0.0] * max(0, len(patterns) - len(lb_z))
+    if ub_z is not None:
+        ub_z = list(ub_z) + [None] * max(0, len(patterns) - len(ub_z))
+
+    for iteration in range(1, 300):
+        z, duals, obj = solve_pmr_lp(patterns, n, lb_z, ub_z)
+
+        if z is None:
+            if verbose:
+                print(f"    Iter {iteration:2d}: PMR infeasivel")
+            return None, None, None, None
+
+        # Subproblema de precificacao (mochila 0-1)
+        max_val, new_items = knapsack_dp(list(duals), weights, capacity)
+        rc = 1.0 - max_val
+
+        if verbose:
+            pi_str = " ".join(f"{d:.4f}" for d in duals)
+            cand_str = ("+".join(inames[i] for i in sorted(new_items))
+                        if new_items else "vazio")
+            print(f"    Iter {iteration:2d}:  obj={obj:.4f} | "
+                  f"pi=[{pi_str}] | "
+                  f"mochila={max_val:.4f} rc={rc:+.4f} | "
+                  f"candidato={{{cand_str}}} | "
+                  f"padroes={len(patterns)}")
+
+        if rc >= -1e-6:
+            if verbose:
+                print(f"    => LP otimo: {obj:.6f}  "
+                      f"({len(patterns)} padroes, {iteration} iteracoes)")
+            break
+
+        new_pat = tuple(sorted(new_items))
+        if new_pat in patterns:
+            if verbose:
+                print(f"    => Padrao candidato ja existe; parando")
+            break
+
+        patterns.append(new_pat)
+        if lb_z is not None:
+            lb_z = lb_z + [0.0]
+        if ub_z is not None:
+            ub_z = ub_z + [None]
+
+    return patterns, z, duals, obj
+
+
+# ------------------------------------------------------------------
+# Branch-and-Price
+# ------------------------------------------------------------------
+
+class BranchAndPrice:
+    """
+    Branch-and-Price para bin packing.
+
+    Em cada no da arvore:
+      - Resolve o PMR por geracao de colunas (LP)
+      - Se fracionario: ramifica em z_p mais fracionario
+        * Ramo down: z_p <= floor(val)   (exclui ou limita o padrao)
+        * Ramo up:   z_p >= ceil(val)    (forca o uso do padrao)
+      - Se inteiro: atualiza incumbente
+
+    Para z_p in (0,1): branching equivale a z_p=0 (excluir) ou z_p=1 (incluir).
+    """
+
+    def __init__(self, weights: list[float], capacity: float, verbose: bool = True):
+        self.weights = weights
+        self.capacity = capacity
+        self.n = len(weights)
+        self.verbose = verbose
+        self.n_nodes = 0
+        self.best_obj = math.inf
+        self.best_patterns: list[tuple] | None = None
+        self.best_z: np.ndarray | None = None
+
+    def solve(self) -> tuple[float, list[tuple] | None, np.ndarray | None]:
+        """Executa B&P. Retorna (obj_inteiro, patterns, z)."""
+        init_patterns = [(i,) for i in range(self.n)]
+        self._branch(init_patterns, lb_z=None, ub_z=None, depth=0)
+        return self.best_obj, self.best_patterns, self.best_z
+
+    def _branch(
+        self,
+        patterns: list[tuple],
+        lb_z: list[float] | None,
+        ub_z: list[float] | None,
+        depth: int,
+    ) -> None:
+        self.n_nodes += 1
+        node_id = self.n_nodes
+        indent = "  " * depth
+        inames = [f"I{i+1}" for i in range(self.n)]
+
+        # Geracao de colunas neste no
+        patterns, z, _, obj = column_generation(
+            self.weights, self.capacity,
+            list(patterns), lb_z, ub_z,
+            verbose=False,
+        )
+
+        if patterns is None:
+            if self.verbose:
+                print(f"{indent}[No {node_id}] Infeasivel")
+            return
+
+        if self.verbose:
+            print(f"{indent}[No {node_id}] LP={obj:.4f} | {len(patterns)} padroes")
+
+        # Poda por bound
+        if obj >= self.best_obj - 1e-6:
+            if self.verbose:
+                print(f"{indent}  Podado ({obj:.4f} >= incumbente {self.best_obj:.0f})")
+            return
+
+        # Verifica integralidade
+        frac = [
+            (p, z[p])
+            for p in range(len(z))
+            if 1e-5 < (z[p] - math.floor(z[p])) < 1 - 1e-5
+        ]
+
+        if not frac:
+            int_obj = float(sum(round(z[p]) for p in range(len(z))))
+            if self.verbose:
+                print(f"{indent}  Solucao inteira: {int_obj:.0f} caixas  [incumbente atualizado]")
+            if int_obj < self.best_obj - 1e-6:
+                self.best_obj = int_obj
+                self.best_patterns = list(patterns)
+                self.best_z = z.copy()
+            return
+
+        # Ramifica na variavel mais fracionaria
+        def frac_part(v: float) -> float:
+            return v - math.floor(v)
+
+        branch_p, val = max(frac, key=lambda t: min(frac_part(t[1]), 1.0 - frac_part(t[1])))
+        floor_val = math.floor(val)
+        ceil_val = math.ceil(val)
+
+        if self.verbose:
+            pat_str = pattern_label(patterns[branch_p], inames)
+            print(f"{indent}  Ramifica z[{{{pat_str}}}]={val:.4f}: "
+                  f"<= {floor_val} (excluir) | >= {ceil_val} (incluir)")
+
+        n_p = len(patterns)
+
+        def extend(base: list | None, length: int, default) -> list:
+            b = list(base) if base else [default] * length
+            while len(b) < length:
+                b.append(default)
+            return b
+
+        # Ramo down: z_p <= floor_val
+        ub_d = extend(ub_z, n_p, None)
+        ub_d[branch_p] = float(floor_val)
+        self._branch(list(patterns), extend(lb_z, n_p, 0.0), ub_d, depth + 1)
+
+        # Ramo up: z_p >= ceil_val
+        lb_u = extend(lb_z, n_p, 0.0)
+        lb_u[branch_p] = float(ceil_val)
+        self._branch(list(patterns), lb_u, extend(ub_z, n_p, None), depth + 1)
+
+
+# ------------------------------------------------------------------
+# FFD heuristica
+# ------------------------------------------------------------------
+
+def ffd_assignment(weights: list[float], capacity: float) -> tuple[dict[int, int], int]:
+    """First-Fit Decreasing. Retorna (item->bin_map, n_bins)."""
     order = sorted(range(len(weights)), key=lambda i: -weights[i])
-    bin_loads: list[float] = []
+    loads: list[float] = []
     item_bin: dict[int, int] = {}
-
     for i in order:
-        placed = False
-        for j, load in enumerate(bin_loads):
+        for j, load in enumerate(loads):
             if load + weights[i] <= capacity + 1e-9:
-                bin_loads[j] += weights[i]
+                loads[j] += weights[i]
                 item_bin[i] = j
-                placed = True
                 break
-        if not placed:
-            item_bin[i] = len(bin_loads)
-            bin_loads.append(float(weights[i]))
-
-    return item_bin, len(bin_loads)
-
-
-def ffd_to_x_vector(
-    item_bin: dict[int, int],
-    n_items: int,
-    n_bins: int,
-) -> np.ndarray:
-    x = np.zeros(n_bins + n_items * n_bins)
-    for i, j in item_bin.items():
-        if j < n_bins:
-            x[iy(j, n_bins)]      = 1.0
-            x[ix(i, j, n_bins)]   = 1.0
-    return x
+        else:
+            item_bin[i] = len(loads)
+            loads.append(float(weights[i]))
+    return item_bin, len(loads)
 
 
 # ------------------------------------------------------------------
-# Solution decoder and printer
+# Display
 # ------------------------------------------------------------------
 
-def decode_solution(
-    result: BBResult,
-    n_items: int,
-    n_bins: int,
-) -> tuple[int, dict[int, list[int]]]:
-    """
-    Returns (n_open_bins, bin_contents) where bin_contents[j] = [item indices].
-    """
-    if result.x is None:
-        return 0, {}
-    open_bins = [j for j in range(n_bins) if result.x[iy(j, n_bins)] > 0.5]
-    bin_contents = {
-        j: [i for i in range(n_items) if result.x[ix(i, j, n_bins)] > 0.5]
-        for j in open_bins
-    }
-    return len(open_bins), bin_contents
-
-
-def print_solution(
-    result: BBResult,
+def print_lp_solution(
+    patterns: list[tuple],
+    z: np.ndarray,
+    obj: float,
     weights: list[float],
     capacity: float,
-    label: str = "",
-    item_names: list[str] | None = None,
-    bin_names: list[str] | None = None,
-):
-    n_items = len(weights)
-    n_bins  = n_items
-    if item_names is None:
-        item_names = [f"I{i+1}" for i in range(n_items)]
-    if bin_names is None:
-        bin_names  = [f"B{j+1}" for j in range(n_bins)]
+    item_names: list[str],
+) -> None:
+    print(f"\n  Relaxacao LP do PMR  (obj = {obj:.6f})")
+    print(f"  {len(patterns)} padroes gerados pela CG:")
+    print(f"\n  {'#':<4} {'Padrao':<22} {'Peso':>5}  {'z_p':>8}  Status")
+    print("  " + "-" * 50)
+    for p, (pat, zval) in enumerate(zip(patterns, z)):
+        label = "{" + "+".join(item_names[i] for i in sorted(pat)) + "}"
+        w = sum(weights[i] for i in pat)
+        fp = zval - math.floor(zval)
+        if zval < 1e-6:
+            status = "zero"
+        elif 1e-5 < fp < 1 - 1e-5:
+            status = f"FRAC ({fp:.4f})"
+        else:
+            status = "INTEIRO"
+        print(f"  p{p+1:<3} {label:<22} {w:>5.0f}  {zval:>8.4f}  {status}")
+    lb = math.ceil(obj - 1e-9)
+    print(f"\n  LB da relaxacao LP: {obj:.4f}  =>  ceil = {lb} caixas")
+    print(f"  Arredondamento ceil(z_p): {int(sum(math.ceil(v - 1e-9) for v in z))} caixas")
 
-    print("\n" + "=" * 62)
+
+def print_integer_solution(
+    patterns: list[tuple],
+    z: np.ndarray,
+    obj: float,
+    weights: list[float],
+    capacity: float,
+    item_names: list[str],
+    label: str = "",
+) -> None:
+    print(f"\n{'=' * 62}")
     if label:
         print(f"  {label}")
-    print(f"Status          : {result.status}")
-    print(f"Nos explorados  : {result.nodes_explored}")
-    print(f"Tempo (s)       : {result.elapsed:.4f}")
-
-    if result.x is None:
-        print("Sem solucao viavel.")
-        print("=" * 62)
-        return
-
-    n_open, bin_contents = decode_solution(result, n_items, n_bins)
-    print(f"Caixas usadas   : {result.obj_value:.0f}")
+    print(f"  Caixas usadas : {obj:.0f}")
     print()
-    print(f"  {'Caixa':<6} {'Itens':<35}  {'Carga':>6}")
-    print("  " + "-" * 50)
-    for j, items in sorted(bin_contents.items()):
-        load = sum(weights[i] for i in items)
+    bin_num = 1
+    for p in range(len(z)):
+        k = int(round(z[p]))
+        if k < 1:
+            continue
+        pat = patterns[p]
+        w = sum(weights[i] for i in pat)
         items_str = ", ".join(
-            f"{item_names[i]}({weights[i]:.0f})" for i in sorted(items)
+            f"{item_names[i]}({weights[i]:.0f})" for i in sorted(pat)
         )
-        print(f"  {bin_names[j]:<6} {items_str:<35}  {load:.0f}/{capacity:.0f}")
+        for _ in range(k):
+            print(f"    Caixa {bin_num}: [{items_str}]  "
+                  f"carga={w:.0f}/{capacity:.0f}")
+            bin_num += 1
     print("=" * 62)
 
 
 # ------------------------------------------------------------------
-# Sensitivity analysis: vary bin capacity
+# Analise de sensibilidade (CG-only para velocidade)
 # ------------------------------------------------------------------
 
 def sensitivity_analysis(
     cap_range: list[float],
     weights: list[float] = DEFAULT_WEIGHTS,
-) -> list[tuple[float, float | None, int]]:
-    """
-    Vary capacity B over cap_range.
-    Returns list of (B, optimal_bins, ffd_bins).
-    """
-    n_items = len(weights)
-    n_bins  = n_items
+) -> list[tuple[float, int | None, int]]:
+    """Varia B: roda CG (LB = ceil do LP) e FFD (UB heuristico)."""
     results = []
     for B in cap_range:
-        model = build_model(weights, B, n_bins)
-        item_bin, ffd_n = ffd_assignment(weights, B)
-        g_x = ffd_to_x_vector(item_bin, n_items, n_bins)
-        r = BranchAndBound(
-            model, strategy="best_first", branching="first_fractional",
-            initial_incumbent=float(ffd_n), initial_x=g_x,
-            verbose=False,
-        ).solve()
-        results.append((B, r.obj_value, ffd_n))
+        _, z, _, obj = column_generation(weights, B, verbose=False)
+        lb_cg = math.ceil(obj - 1e-9) if obj is not None else None
+        _, ffd_n = ffd_assignment(weights, B)
+        results.append((B, lb_cg, ffd_n))
     return results
 
 
@@ -286,75 +459,105 @@ def sensitivity_analysis(
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
-    fn = ITEM_NAMES
-    bn = BIN_NAMES
     W  = DEFAULT_WEIGHTS
     B  = DEFAULT_CAPACITY
-
-    print("=" * 62)
-    print("PROBLEMA 9 - Empacotamento de Caixas (Bin Packing PIB)")
-    print("=" * 62)
-
+    fn = ITEM_NAMES
+    n  = N_ITEMS
     total_w = sum(W)
-    lb = math.ceil(total_w / B)
-    print(f"\n  {N_ITEMS} itens | capacidade B = {B:.0f}")
+
+    print("=" * 62)
+    print("PROBLEMA 9 - Bin Packing via Geracao de Colunas + B&P")
+    print("=" * 62)
+    print(f"\n  {n} itens | capacidade B = {B:.0f}")
     print(f"  Pesos : {W}")
     print(f"  Soma  : {total_w:.0f}")
-    print(f"  Limite inferior LP: ceil({total_w:.0f}/{B:.0f}) = {lb}")
+    print(f"  LB trivial: ceil({total_w:.0f}/{B:.0f}) = {math.ceil(total_w / B)}")
 
-    model = build_model(W, B, N_BINS, fn, bn)
+    all_pats = generate_all_feasible_patterns(W, B)
+    print(f"  Padroes viaveis (enumeracao): {len(all_pats)}")
 
+    # ---- FFD ----
     item_bin, ffd_n = ffd_assignment(W, B)
-    g_x = ffd_to_x_vector(item_bin, N_ITEMS, N_BINS)
-
     print(f"\n  Heuristica FFD: {ffd_n} caixas")
     for j in sorted(set(item_bin.values())):
         items_in = sorted(i for i, b in item_bin.items() if b == j)
         load = sum(W[i] for i in items_in)
         s = ", ".join(f"{fn[i]}({W[i]:.0f})" for i in items_in)
-        print(f"    {bn[j]}: [{s}] = {load:.0f}")
+        print(f"    Caixa {j+1}: [{s}] = {load:.0f}")
 
-    print("\n--- Branch-and-Bound ---")
-    bb = BranchAndBound(
-        model, strategy="best_first", branching="first_fractional",
-        initial_incumbent=float(ffd_n), initial_x=g_x,
-    )
-    r_bb = bb.solve()
-    print_solution(r_bb, W, B, label="B&B | Instancia original",
-                   item_names=fn, bin_names=bn)
-
-    print("\n--- Branch-and-Cut (cortes de Gomory) ---")
-    bc = BranchAndCut(
-        model, strategy="best_first", branching="first_fractional",
-        cut_types=["gomory"],
-        initial_incumbent=float(ffd_n), initial_x=g_x,
-    )
-    r_bc = bc.solve()
-    print_solution(r_bc, W, B, label="B&C | Instancia original",
-                   item_names=fn, bin_names=bn)
-
-    print(f"\nB&B nos={r_bb.nodes_explored} | B&C nos={r_bc.nodes_explored}")
-
-    # ---- Sensitivity: vary B ----
+    # ================================================================
+    # Geracao de Colunas - relaxacao LP
+    # ================================================================
     print("\n" + "=" * 62)
-    print("ANALISE DE SENSIBILIDADE — capacidade B")
+    print("GERACAO DE COLUNAS - relaxacao LP do PMR")
     print("=" * 62)
+    print("\n  Padroes iniciais: singletons (1 item por caixa)")
+    for i in range(n):
+        print(f"    p{i+1}: {{{fn[i]}}}  peso={W[i]:.0f}")
+    print()
+
+    lp_patterns, z_lp, duals_lp, obj_lp = column_generation(W, B, verbose=True)
+
+    print_lp_solution(lp_patterns, z_lp, obj_lp, W, B, fn)
+
+    # ================================================================
+    # Branch-and-Price
+    # ================================================================
+    print("\n" + "=" * 62)
+    print("BRANCH-AND-PRICE")
+    print("=" * 62)
+    print()
+
+    bp = BranchAndPrice(W, B, verbose=True)
+    bp_obj, bp_pats, bp_z = bp.solve()
+
+    if bp_pats is not None:
+        print_integer_solution(
+            bp_pats, bp_z, bp_obj, W, B, fn,
+            label="B&P | Solucao otima inteira",
+        )
+
+    # ================================================================
+    # Comparacao
+    # ================================================================
+    print("\n" + "=" * 62)
+    print("COMPARACAO")
+    print("=" * 62)
+    lb_lp    = math.ceil(obj_lp - 1e-9)
+    rounded  = int(sum(math.ceil(v - 1e-9) for v in z_lp))
+    print(f"  Relaxacao LP (CG)       : {obj_lp:.4f}")
+    print(f"  LB = ceil(LP)           : {lb_lp} caixas")
+    print(f"  Arredondamento ceil(z_p): {rounded} caixas  "
+          f"({'otimo' if rounded == bp_obj else 'subotimo'})")
+    print(f"  FFD heuristica          : {ffd_n} caixas  "
+          f"({'otimo' if ffd_n == bp_obj else 'subotimo'})")
+    print(f"  B&P (exato)             : {bp_obj:.0f} caixas")
+    print(f"  Nos B&P                 : {bp.n_nodes}")
+
+    # ================================================================
+    # Analise de sensibilidade
+    # ================================================================
+    print("\n" + "=" * 62)
+    print("ANALISE DE SENSIBILIDADE - capacidade B")
+    print("=" * 62)
+
     cap_range = [float(v) for v in range(6, 14)]
     sens = sensitivity_analysis(cap_range, W)
 
-    print(f"\n  {'B':>5}  {'LB=ceil(22/B)':>14}  {'Otimo':>7}  {'FFD':>5}  {'FFD=Otimo?':>10}")
-    print("  " + "-" * 52)
-    prev_opt = None
-    for B_val, n_opt, ffd_bins in sens:
-        lb_val = math.ceil(total_w / B_val)
-        marker = " <-- muda" if n_opt != prev_opt and prev_opt is not None else ""
-        ffd_ok = "SIM" if ffd_bins == n_opt else "NAO *"
-        print(f"  {B_val:>5.0f}  {lb_val:>14}  {n_opt:>7.0f}  {ffd_bins:>5}  {ffd_ok:>10}{marker}")
-        prev_opt = n_opt
+    print(f"\n  {'B':>4}  {'LB=ceil(22/B)':>14}  {'CG(ceil LB)':>12}  {'FFD':>5}  {'FFD=opt?':>9}")
+    print("  " + "-" * 55)
+    prev = None
+    for B_val, cg_val, ffd_val in sens:
+        lb_triv = math.ceil(total_w / B_val)
+        marker = " <-- muda" if cg_val != prev and prev is not None else ""
+        ffd_ok = "SIM" if ffd_val == cg_val else "NAO *"
+        cg_str = str(cg_val) if cg_val is not None else "?"
+        print(f"  {B_val:>4.0f}  {lb_triv:>14}  {cg_str:>12}  {ffd_val:>5}  {ffd_ok:>9}{marker}")
+        prev = cg_val
 
-    print("\n  * FFD subotimo: B=11, FFD da 3 caixas mas otimo e 2")
+    print("\n  * CG(ceil LB) e o teto da relaxacao LP - upper bound valido.")
+    print("  * FFD subotimo em B=11: da 3 caixas, otimo e 2.")
     print("\nInterpretacao:")
-    print(f"  B =  6, 7  -> 4 caixas (ceil(22/B) >= 4, 3 caixas nao cabem)")
-    print(f"  B =  8-10  -> 3 caixas  ex.: {{I1,I2}}, {{I3,I4,I5}}, {{I6}}")
-    print(f"  B = 11-13  -> 2 caixas  ex.: {{I1,I4,I6}}, {{I2,I3,I5}}")
-    print(f"  Transicoes: B=8 (4->3 caixas), B=11 (3->2 caixas)")
+    print(f"  B =  6, 7  -> 4 caixas  (3*7=21 < 22, impossivel em 3)")
+    print(f"  B =  8-10  -> 3 caixas  ex: {{I1,I2}}, {{I3,I4,I5}}, {{I6}}")
+    print(f"  B = 11-13  -> 2 caixas  ex: {{I1,I4,I6}}, {{I2,I3,I5}}")

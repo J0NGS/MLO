@@ -8,12 +8,13 @@ import numpy as np
 class MIPModel:
     """Generic Mixed-Integer Program in standard form.
 
-    Solves: sense{c @ x}
+    Optimize (min/max): c @ x
     Subject to:
         A_ub @ x <= b_ub   (optional)
         A_eq @ x == b_eq   (optional)
-        bounds[i] = (lb_i, ub_i) for each variable
-        integrality[i] = 0 (continuous), 1 (integer), 2 (binary)
+        x_i in [lb_i, ub_i]  (bounds for each variable)
+        x_i ∈ {continuous, integer, binary}  (integrality constraint)
+    @ = matricial
     """
     c: np.ndarray                                       # coeficientes da função objetivo
     bounds: list[tuple[float | None, float | None]]     # (lb, ub) de cada variável; o b&b altera isso no branching

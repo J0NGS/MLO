@@ -7,6 +7,7 @@ Subject to:
     x3 <= x1                         (P3 só se P1) → x3 - x1 <= 0
     x4 + x5 <= 1                     (P4 e P5 mutuamente exclusivos)
     x1 + x2 + x4 >= 2               (ao menos 2 de {P1,P2,P4}) → -x1 - x2 - x4 <= -2
+    sum_i x_i >= 4                   (ao menos 4 projetos selecionados) → -sum_i x_i <= -4
     xi in {0, 1}   for all i
 
 Variables: x0..x5 = P1..P6 (0-indexed)
@@ -22,10 +23,10 @@ from core import MIPModel, BranchAndBound, BranchAndCut
 
 def build_model() -> MIPModel:
     # traduz o problema real em vetores e matrizes pra passar pro MIPModel
-    costs  = [80,  60,  90,  50,  70,  100]   # custo de cada projeto p1..p6 (em R$ mil)
-    impact = [120, 85, 140,  60, 110,  160]   # impacto (pontos) de cada projeto
-    budget = 280
-    n = 6
+    costs  = [80,  60,  90,  50,  70,  100, 75, 60, 40]   # custo de cada projeto p1..p6 (em R$ mil)
+    impact = [150, 40, 100,  60, 55,  200, 100, 50, 10]   # impacto (pontos) de cada projeto
+    budget = 250
+    n = 9
 
     # função objetivo maximizar impacto total;
     c = list(impact)
@@ -60,6 +61,11 @@ def build_model() -> MIPModel:
     row[3] = -1
     A_ub.append(row)
     b_ub.append(-2)
+
+    # restrição 5; selecionar ao menos 4 projetos; sum(x) >= 4 vira -sum(x) <= -4
+    row = [-1] * n
+    A_ub.append(row)
+    b_ub.append(-4)
 
     # monta o modelo; todas as variáveis são binárias (0 ou 1); problema de maximização
     return MIPModel(
@@ -102,12 +108,12 @@ if __name__ == "__main__":
     print_solution(result_bb, model)
 
     print("\n" + "=" * 60)
-    print("PROBLEMA 2 — Branch-and-Cut (Gomory cuts)")
+    print("PROBLEMA 2 — Branch-and-Cut (Cover cuts)")
     print("=" * 60)
-    # b&c; mesma estratégia de exploração; mas tenta adicionar cortes de gomory antes de ramificar
+    # b&c; mesma estratégia de exploração; mas tenta adicionar cortes de cover antes de ramificar
     # cortes apertam o lp; tendem a reduzir o número de nós explorados
     solver_bc = BranchAndCut(model, strategy="best_first", branching="most_infeasible",
-                              cut_types=["gomory"])
+                              cut_types=["cover_cuts"])
     result_bc = solver_bc.solve()
     print_solution(result_bc, model)
 
