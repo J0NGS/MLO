@@ -153,7 +153,7 @@ class BranchAndCut(BranchAndBound):
         n_total  = n_gomory + n_cover
         var_names = self.model.var_names
         n = len(self.model.c)
-        print(f"\n{pad}    [B&C] No {node.id} - rodada {round_num}: {n_total} corte(s)  "
+        print(f"\n{pad}[B&C] No {node.id} - rodada {round_num}: {n_total} corte(s)  "
               f"[{n_gomory} Gomory, {n_cover} Cover]")
         for d in cut_details:
             t = d.get("type")

@@ -418,8 +418,7 @@ class TimetablingBranchAndCut(BranchAndCut):
         n_total  = n_gomory + n_cover + n_clique
         var_names= self.model.var_names
         n        = len(self.model.c)
-        p        = pad + "    "
-        print(f"\n{p}[B&C] No {node.id} - rodada {round_num}: {n_total} corte(s)  "
+        print(f"\n{pad}[B&C] No {node.id} - rodada {round_num}: {n_total} corte(s)  "
               f"[{n_gomory} Gomory, {n_cover} Cover, {n_clique} Clique]")
         for d in cut_details:
             t = d.get("type")
@@ -432,7 +431,7 @@ class TimetablingBranchAndCut(BranchAndCut):
             elif t == "clique":
                 disc_names = self.inst.disc_names
                 names = " + ".join(disc_names[i] for i in d["clique"])
-                print(f"{p}>> Clique [{names}] no horario {d['slot_name']}  "
+                print(f"{pad}>> Clique [{names}] no horario {d['slot_name']}  "
                       f"(soma={d['lhs_val']:.4f})  violacao={d['violation']:.4f}")
                 print()
 

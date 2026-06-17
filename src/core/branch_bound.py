@@ -58,6 +58,7 @@ class BranchAndBound:
         self._incumbent: Optional[float] = initial_incumbent
         self._best_x: Optional[np.ndarray] = initial_x
         self._log: list[NodeLog] = []
+        self._log_by_id: dict[int, NodeLog] = {}  # acesso O(1) ao log por node_id
 
     # ------------------------------------------------------------------
     # Public API
@@ -66,6 +67,7 @@ class BranchAndBound:
     def solve(self) -> BBResult:
         # loop principal: cria a raiz, coloca na fila e processa nó a nó
         t0 = time.perf_counter()
+        self._log_by_id = {}
 
         root = self._make_root()
         queue = self._make_queue()
@@ -91,7 +93,7 @@ class BranchAndBound:
             decision, cuts_added = self._process_node(node, lp)
             node.decision = decision
 
-            self._log.append(NodeLog(
+            entry = NodeLog(
                 node_id=node.id,
                 parent_id=node.parent_id,
                 depth=node.depth,
@@ -103,7 +105,9 @@ class BranchAndBound:
                 best_incumbent=self._incumbent,
                 decision=decision,
                 cuts_added=cuts_added,
-            ))
+            )
+            self._log.append(entry)
+            self._log_by_id[node.id] = entry
 
             self._print_node(node, cuts_added)
 
